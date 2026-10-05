@@ -1,6 +1,7 @@
 /**
  * 区间与环片状态（Pinia）
  * 维护区间/环片列表、当前选中区间与里程筛选条件。
+ * v3：区分「当前环（在役）」与「已换环历史（留档）」，换环后的新环沿用原环号从零建档。
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -22,19 +23,28 @@ import {
   type SectionDraft,
   type StructureType
 } from '@/types/section'
-import { SEGMENT_TYPES, type Ring, type RingDraft } from '@/types/ring'
+import { isArchivedRing, ringDisplayLabel, SEGMENT_TYPES, type Ring, type RingDraft } from '@/types/ring'
+import { useReplacementStore } from '@/stores/replacementStore'
 
 export interface RingEnriched {
   ring: Ring
   section: Section | null
-  /** 环号展示文案 */
+  /** 环号展示文案（留档环带「已换环」后缀） */
   label: string
   mileageText: string
+  /** 是否为换环留档环 */
+  archived: boolean
+  /** 关联的进行中换环单（待确认/失败），用于在台账上提示「待换环」 */
+  pendingReplacementId: string | null
 }
+
+/** 台账环片范围：当前在役环 / 已换环留档环 */
+export type RingScope = 'current' | 'archived'
 
 export const useSectionStore = defineStore('section', () => {
   const sectionTable = useIdbTable<SectionRow>((database) => database.sections, { sortByUpdatedAt: false })
   const ringTable = useIdbTable<RingRow>((database) => database.rings, { sortByUpdatedAt: false })
+  const replacementStore = useReplacementStore()
 
   const prefs = readUiPrefs()
   const currentSectionId = ref<string | null>(prefs.lastSectionId)
@@ -42,6 +52,8 @@ export const useSectionStore = defineStore('section', () => {
   const structureTypes = ref<StructureType[]>([])
   const mileageFrom = ref<number | null>(null)
   const mileageTo = ref<number | null>(null)
+  /** 环片明细范围，默认只看当前在役环；切到 archived 查看已换环历史 */
+  const ringScope = ref<RingScope>('current')
 
   /* ------------------------------ 区间 ------------------------------ */
 
@@ -118,17 +130,27 @@ export const useSectionStore = defineStore('section', () => {
     [...ringTable.rows.value].sort((a, b) => a.mileage - b.mileage || a.ringNo - b.ringNo)
   )
 
+  /** 当前在役环（裂缝台账、复测、预警的默认口径） */
+  const currentRings = computed<RingRow[]>(() => rings.value.filter((ring) => !isArchivedRing(ring)))
+
+  /** 已换环留档环（换环前裂缝/复测/建议仍按这些环可查） */
+  const archivedRings = computed<RingRow[]>(() => rings.value.filter((ring) => isArchivedRing(ring)))
+
   const ringsOfSection = computed<RingRow[]>(() =>
     currentSectionId.value === null ? rings.value : rings.value.filter((ring) => ring.sectionId === currentSectionId.value)
   )
 
   const enrichedRings = computed<RingEnriched[]>(() =>
-    ringsOfSection.value.map((ring) => ({
-      ring,
-      section: sections.value.find((section) => section.id === ring.sectionId) ?? null,
-      label: `第 ${ring.ringNo} 环`,
-      mileageText: formatMileage(ring.mileage)
-    }))
+    ringsOfSection.value
+      .filter((ring) => (ringScope.value === 'archived' ? isArchivedRing(ring) : !isArchivedRing(ring)))
+      .map((ring) => ({
+        ring,
+        section: sections.value.find((section) => section.id === ring.sectionId) ?? null,
+        label: ringDisplayLabel(ring),
+        mileageText: formatMileage(ring.mileage),
+        archived: isArchivedRing(ring),
+        pendingReplacementId: replacementStore.pendingOfRing(ring.id)?.id ?? null
+      }))
   )
 
   const filteredRings = computed<RingEnriched[]>(() => {
@@ -155,6 +177,10 @@ export const useSectionStore = defineStore('section', () => {
     structureTypes.value = values
   }
 
+  function setRingScope(scope: RingScope): void {
+    ringScope.value = scope
+  }
+
   function resetFilter(): void {
     keyword.value = ''
     structureTypes.value = []
@@ -169,7 +195,8 @@ export const useSectionStore = defineStore('section', () => {
         ringNo: Math.max(0, Math.round(draft.ringNo)),
         mileage: Math.max(0, Math.round(draft.mileage)),
         segmentType: draft.segmentType,
-        installDate: draft.installDate
+        installDate: draft.installDate,
+        lifecycle: 'current'
       },
       'ring'
     )) as RingRow
@@ -177,6 +204,10 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function updateRing(id: string, patch: Partial<RingDraft>): Promise<void> {
+    const existing = await db.rings.get(id)
+    if (existing && isArchivedRing(existing)) {
+      throw new Error('该环为换环前留档环，环片里程信息只读')
+    }
     const next: Partial<RingRow> = { ...patch }
     if (patch.ringNo !== undefined) next.ringNo = Math.max(0, Math.round(patch.ringNo))
     if (patch.mileage !== undefined) next.mileage = Math.max(0, Math.round(patch.mileage))
@@ -190,9 +221,21 @@ export const useSectionStore = defineStore('section', () => {
   /** 区间跨度合计（页头展示） */
   const totalSpan = computed(() => sections.value.reduce((sum, section) => sum + sectionSpan(section), 0))
 
-  /** 供其它 store 复用的索引 */
+  /** 供其它 store 复用的索引（全部环，含留档） */
   const sectionById = computed(() => new Map(sections.value.map((section) => [section.id, section])))
   const ringById = computed(() => new Map(rings.value.map((ring) => [ring.id, ring])))
+
+  /** 环片是否已留档（找不到环按非留档处理，由具体写入门禁再拦截） */
+  function isRingArchived(ringId: string): boolean {
+    const ring = ringById.value.get(ringId)
+    return ring ? isArchivedRing(ring) : false
+  }
+
+  /** 裂缝 id → 所属环是否留档（供复测/建议页判断历史只读） */
+  function crackRingArchived(crack: { ringId: string } | undefined | null): boolean {
+    if (!crack) return false
+    return isRingArchived(crack.ringId)
+  }
 
   return {
     sectionTable,
@@ -200,6 +243,8 @@ export const useSectionStore = defineStore('section', () => {
     sections,
     filteredSections,
     rings,
+    currentRings,
+    archivedRings,
     ringsOfSection,
     enrichedRings,
     filteredRings,
@@ -210,6 +255,7 @@ export const useSectionStore = defineStore('section', () => {
     structureTypes,
     mileageFrom,
     mileageTo,
+    ringScope,
     structureTypeOptions: STRUCTURE_TYPES,
     segmentTypeOptions: SEGMENT_TYPES,
     totalSpan,
@@ -224,7 +270,10 @@ export const useSectionStore = defineStore('section', () => {
     removeRing,
     setMileageRange,
     setStructureTypes,
+    setRingScope,
     resetFilter,
+    isRingArchived,
+    crackRingArchived,
     /** 直连 Dexie 供页面做单条查询 */
     getRing: (id: string) => db.rings.get(id)
   }

@@ -7,13 +7,15 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Files, Grid, Plus, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, Files, Grid, Plus, Switch, TrendCharts } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
-import { useSectionStore, type RingEnriched } from '@/stores/sectionStore'
+import ReplacementWizard from '@/components/ReplacementWizard.vue'
+import { useSectionStore, type RingEnriched, type RingScope } from '@/stores/sectionStore'
 import { useCrackStore } from '@/stores/crackStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useReplacementStore } from '@/stores/replacementStore'
 import { EMPTY_RING_DRAFT, type Ring, type RingDraft } from '@/types/ring'
 import { EMPTY_SECTION_DRAFT, formatMileage, type Section, type SectionDraft, type StructureType } from '@/types/section'
 
@@ -23,6 +25,31 @@ const router = useRouter()
 const sectionStore = useSectionStore()
 const crackStore = useCrackStore()
 const surveyStore = useSurveyStore()
+const replacementStore = useReplacementStore()
+
+/* ---------------------------- 换环向导 ---------------------------- */
+
+const wizardVisible = ref(false)
+const wizardRingId = ref<string | null>(null)
+const wizardRepId = ref<string | null>(null)
+
+function openReplace(ring: Ring): void {
+  wizardRepId.value = null
+  wizardRingId.value = ring.id
+  wizardVisible.value = true
+}
+
+function pendingOf(ringId: string) {
+  return replacementStore.pendingOfRing(ringId)
+}
+
+function completedRepOf(ringId: string) {
+  return replacementStore.completedOfOldRing(ringId)
+}
+
+function setRingScope(scope: RingScope): void {
+  sectionStore.setRingScope(scope)
+}
 
 /* ------------------------------ 筛选 ------------------------------ */
 
@@ -130,6 +157,10 @@ const ringRules: FormRules = {
 }
 
 function openCreateRing(): void {
+  if (sectionStore.ringScope === 'archived') {
+    ElMessage.warning('已换环历史中的环片只读，不能录入新环；请切回「当前在役环」')
+    return
+  }
   if (!sectionStore.currentSectionId) {
     ElMessage.warning('请先选择或新建一个区间')
     return
@@ -154,18 +185,22 @@ function openEditRing(ring: Ring): void {
 }
 
 async function submitRing(): Promise<void> {
-  const form = ringFormRef.value
-  if (!form) return
-  const valid = await form.validate().catch(() => false)
+  const formInstance = ringFormRef.value
+  if (!formInstance) return
+  const valid = await formInstance.validate().catch(() => false)
   if (!valid) return
-  if (editingRingId) {
-    await sectionStore.updateRing(editingRingId, { ...ringForm })
-    ElMessage.success('环片已更新')
-  } else {
-    await sectionStore.createRing({ ...ringForm })
-    ElMessage.success('环片已录入')
+  try {
+    if (editingRingId) {
+      await sectionStore.updateRing(editingRingId, { ...ringForm })
+      ElMessage.success('环片已更新')
+    } else {
+      await sectionStore.createRing({ ...ringForm })
+      ElMessage.success('环片已录入')
+    }
+    ringDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  ringDialogVisible.value = false
 }
 
 async function removeRing(ring: Ring): Promise<void> {
@@ -175,8 +210,12 @@ async function removeRing(ring: Ring): Promise<void> {
     { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await sectionStore.removeRing(ring.id)
-  ElMessage.success('环片及其下游数据已删除')
+  try {
+    await sectionStore.removeRing(ring.id)
+    ElMessage.success('环片及其下游数据已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 /* ---------------------------- 派生展示 ---------------------------- */
@@ -196,6 +235,21 @@ function rateOf(crackId: string): number {
 function goCrackEntry(sectionId: string): void {
   crackStore.patchFilter({ sectionId, keyword: '', lines: [], positions: [], directions: [], states: [] })
   void router.push('/cracks')
+}
+
+function ringRowClassName({ row }: { row: RingEnriched }): string {
+  return row.archived ? 'row-archived' : ''
+}
+
+function openArchivedRow(row: RingEnriched): void {
+  const repId = row.ring.replacedById ?? replacementStore.completedOfOldRing(row.ring.id)?.id ?? null
+  if (!repId) {
+    ElMessage.warning('该留档环缺少换环单溯源信息')
+    return
+  }
+  wizardRingId.value = null
+  wizardRepId.value = repId
+  wizardVisible.value = true
 }
 
 const mileageInput = reactive<{ from: number | null; to: number | null }>({
@@ -219,8 +273,10 @@ function ringRowKey(row: RingEnriched): string {
   return row.ring.id
 }
 
-const totalCracks = computed(() => crackStore.cracks.length)
-const totalRings = computed(() => sectionStore.rings.length)
+const totalCracks = computed(() => crackStore.currentCracks.length)
+const totalRings = computed(() => sectionStore.currentRings.length)
+const totalArchivedRings = computed(() => sectionStore.archivedRings.length)
+const totalArchivedCracks = computed(() => crackStore.archivedCracks.length)
 </script>
 
 <template>
@@ -240,8 +296,8 @@ const totalRings = computed(() => sectionStore.rings.length)
 
     <div class="stat-row">
       <StatBadge label="区间总数" :value="sectionStore.sections.length" suffix="个" icon="Files" tone="primary" />
-      <StatBadge label="环片总数" :value="totalRings" suffix="环" icon="Grid" tone="info" />
-      <StatBadge label="裂缝总数" :value="totalCracks" suffix="条" icon="Histogram" tone="default" />
+      <StatBadge label="在役环片" :value="totalRings" suffix="环" icon="Grid" tone="info" />
+      <StatBadge label="当前裂缝" :value="totalCracks" suffix="条" icon="Histogram" tone="default" />
       <StatBadge
         label="预警占比"
         :value="crackStore.warningCount"
@@ -249,6 +305,7 @@ const totalRings = computed(() => sectionStore.rings.length)
         icon="WarningFilled"
         tone="danger"
       />
+      <StatBadge label="已换环留档" :value="totalArchivedRings" :suffix="`环 / ${totalArchivedCracks} 条裂缝`" icon="Switch" tone="warning" />
     </div>
 
     <FilterBar
@@ -309,6 +366,14 @@ const totalRings = computed(() => sectionStore.rings.length)
             <span v-if="sectionStore.currentSection" class="muted">· {{ sectionStore.currentSection.line }}</span>
           </h3>
           <div class="panel-head__filter">
+            <el-radio-group
+              :model-value="sectionStore.ringScope"
+              size="small"
+              @update:model-value="(value: RingScope) => setRingScope(value)"
+            >
+              <el-radio-button value="current">当前在役环</el-radio-button>
+              <el-radio-button value="archived">已换环历史</el-radio-button>
+            </el-radio-group>
             <el-input-number
               v-model="mileageInput.from"
               :min="0"
@@ -332,21 +397,41 @@ const totalRings = computed(() => sectionStore.rings.length)
 
         <EmptyPanel
           v-if="sectionStore.filteredRings.length === 0"
-          title="该区间暂无环片"
-          description="按里程录入环片后，可在展开行查看每一环的裂缝明细。"
-          action-text="录入环片"
+          :title="sectionStore.ringScope === 'archived' ? '该区间暂无换环留档环' : '该区间暂无环片'"
+          :description="
+            sectionStore.ringScope === 'archived'
+              ? '整环更换后，原环会整体留档在此，换环前裂缝与全部复测仍按原环片可查。'
+              : '按里程录入环片后，可在展开行查看每一环的裂缝明细。'
+          "
+          :action-text="sectionStore.ringScope === 'archived' ? '' : '录入环片'"
           secondary-text="清除筛选"
           compact
           @action="openCreateRing"
           @secondary="sectionStore.resetFilter()"
         />
 
-        <el-table v-else :data="sectionStore.filteredRings" :row-key="ringRowKey" border stripe>
+        <el-table
+          v-else
+          :data="sectionStore.filteredRings"
+          :row-key="ringRowKey"
+          border
+          stripe
+          :row-class-name="ringRowClassName"
+        >
           <el-table-column type="expand">
             <template #default="{ row }">
               <div style="padding: 8px 16px">
                 <div class="muted" style="margin-bottom: 6px">
-                  第 {{ row.ring.ringNo }} 环共 {{ cracksOfRing(row.ring.id).length }} 条裂缝
+                  {{ row.label }}共 {{ cracksOfRing(row.ring.id).length }} 条裂缝
+                  <el-tag v-if="row.archived" size="small" type="warning" effect="plain" style="margin-left: 8px">
+                    换环前记录 · 只读留档（{{ completedRepOf(row.ring.id)?.replaceDate ?? '—' }} 换环）
+                  </el-tag>
+                  <el-tag v-else-if="pendingOf(row.ring.id)" size="small" type="danger" effect="plain" style="margin-left: 8px">
+                    {{ pendingOf(row.ring.id)?.status === '失败' ? '换环单失败待重试' : '有待确认换环单' }}
+                  </el-tag>
+                  <el-tag v-else-if="row.ring.replacementId" size="small" type="success" effect="plain" style="margin-left: 8px">
+                    换环新装环 · {{ row.ring.installDate }} 安装
+                  </el-tag>
                 </div>
                 <el-table :data="cracksOfRing(row.ring.id)" size="small" border>
                   <el-table-column prop="code" label="裂缝编号" width="140" />
@@ -369,14 +454,17 @@ const totalRings = computed(() => sectionStore.rings.length)
                     </template>
                   </el-table-column>
                   <template #empty>
-                    <span class="muted">该环暂未登记裂缝</span>
+                    <span class="muted">{{ row.archived ? '该留档环无裂缝记录' : '该环暂未登记裂缝' }}</span>
                   </template>
                 </el-table>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="环号" width="100">
-            <template #default="{ row }">第 {{ row.ring.ringNo }} 环</template>
+          <el-table-column label="环号" width="150">
+            <template #default="{ row }">
+              {{ row.label }}
+              <el-tag v-if="row.archived" size="small" type="info" effect="plain" style="margin-left: 6px">已换环</el-tag>
+            </template>
           </el-table-column>
           <el-table-column label="里程" width="120">
             <template #default="{ row }">{{ row.mileageText }}</template>
@@ -388,11 +476,18 @@ const totalRings = computed(() => sectionStore.rings.length)
           <el-table-column label="裂缝数" width="90">
             <template #default="{ row }">{{ cracksOfRing(row.ring.id).length }}</template>
           </el-table-column>
-          <el-table-column label="操作" min-width="200" fixed="right">
+          <el-table-column label="操作" min-width="260" fixed="right">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="openEditRing(row.ring)">编辑</el-button>
-              <el-button size="small" text type="danger" @click="removeRing(row.ring)">删除</el-button>
-              <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">裂缝台账</el-button>
+              <template v-if="row.archived">
+                <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">历史裂缝</el-button>
+                <el-button size="small" text type="primary" @click="openArchivedRow(row)">换环详情</el-button>
+              </template>
+              <template v-else>
+                <el-button size="small" text type="primary" @click="openEditRing(row.ring)">编辑</el-button>
+                <el-button size="small" text type="danger" @click="removeRing(row.ring)">删除</el-button>
+                <el-button size="small" text type="warning" :icon="Switch" @click="openReplace(row.ring)">换环</el-button>
+                <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">裂缝台账</el-button>
+              </template>
             </template>
           </el-table-column>
         </el-table>
@@ -450,6 +545,8 @@ const totalRings = computed(() => sectionStore.rings.length)
         <el-button type="primary" @click="submitRing">保存</el-button>
       </template>
     </el-dialog>
+
+    <ReplacementWizard v-model="wizardVisible" :replacement-id="wizardRepId" :default-old-ring-id="wizardRingId" />
   </div>
 </template>
 
@@ -472,5 +569,10 @@ const totalRings = computed(() => sectionStore.rings.length)
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+:deep(.row-archived) {
+  background: #f5f6f8 !important;
+  color: #8c99ab;
 }
 </style>

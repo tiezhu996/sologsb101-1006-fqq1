@@ -3,10 +3,11 @@
  * 全部在浏览器本地完成，不经过任何服务端。
  */
 import type { Section } from '@/types/section'
-import type { Ring } from '@/types/ring'
+import { isArchivedRing, type Ring } from '@/types/ring'
 import type { Crack, CrackState } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { Replacement } from '@/types/replacement'
 import { formatMileage } from '@/types/section'
 import { buildSurveyPoints } from '@/utils/rate'
 
@@ -37,19 +38,29 @@ export function exportBackupJson(payload: unknown): string {
   return filename
 }
 
-/** 导出裂缝台账 CSV（含所属区间/环片/最新速率/处置状态） */
+/**
+ * 导出裂缝台账 CSV（含所属区间/环片版本/换环信息/最新速率/处置状态）。
+ * 当前环与已换环留档环都导出，通过「环片状态」「换环日期」两列区分，避免新旧环混淆。
+ */
 export function exportCrackCsv(
   sections: Section[],
   rings: Ring[],
   cracks: Crack[],
   surveys: Survey[],
-  advices: Advice[]
+  advices: Advice[],
+  replacements: Replacement[] = []
 ): string {
+  const repByOldRing = new Map(
+    replacements.filter((item) => item.status === '已完成').map((item) => [item.oldRingId, item])
+  )
   const header = [
     '线路',
     '区间起里程',
     '区间止里程',
     '环号',
+    '环片状态',
+    '换环日期',
+    '新环安装日期',
     '里程',
     '裂缝编号',
     '部位',
@@ -70,12 +81,17 @@ export function exportCrackCsv(
     const section = sections.find((item) => item.id === crack.sectionId)
     const points = buildSurveyPoints(surveys.filter((survey) => survey.crackId === crack.id))
     const advice = advices.find((item) => item.crackId === crack.id)
+    const archived = ring ? isArchivedRing(ring) : false
+    const rep = archived && ring ? repByOldRing.get(ring.id) : undefined
     lines.push(
       [
         section ? section.line : '—',
         section ? formatMileage(section.startMileage) : '—',
         section ? formatMileage(section.endMileage) : '—',
         ring ? ring.ringNo : '—',
+        archived ? '已换环(历史)' : '当前环',
+        rep ? rep.replaceDate : '—',
+        !archived && ring?.replacementId ? ring.installDate : '—',
         ring ? formatMileage(ring.mileage) : '—',
         crack.code,
         crack.position,
@@ -95,7 +111,7 @@ export function exportCrackCsv(
     )
   })
   const filename = `裂缝复测台账-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

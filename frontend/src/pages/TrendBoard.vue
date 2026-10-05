@@ -72,8 +72,17 @@ const ranked = computed<CrackEnriched[]>(() => {
   return [...source].sort((a, b) => b.rate - a.rate)
 })
 
+/** 统计跟随当前查看范围（默认只看在役环，历史预警需主动切换） */
 const severeRows = computed(() => crackStore.enriched.filter((item) => item.level === '严重'))
 const warningRows = computed(() => crackStore.enriched.filter((item) => item.level !== '一般'))
+
+const archivedWarningCount = computed(() => surveyStore.archivedWarningCrackIds.length)
+
+function setScope(scope: 'current' | 'archived'): void {
+  crackStore.setScope(scope)
+}
+
+const isArchivedScope = computed(() => crackStore.scope === 'archived')
 
 const averageRate = computed(() => {
   const rated = crackStore.enriched.filter((item) => item.surveyCount > 1)
@@ -88,6 +97,10 @@ function adviceOf(crackId: string): Advice | null {
 }
 
 async function generateAdvice(row: CrackEnriched): Promise<void> {
+  if (row.archived) {
+    ElMessage.warning('该裂缝属于换环前留档环，不能为历史裂缝新生成整治建议')
+    return
+  }
   if (adviceOf(row.crack.id)) {
     ElMessage.info(`${row.crack.code} 已存在整治建议，可在「建议与备份」页维护`)
     return
@@ -202,6 +215,10 @@ function onOnlyWarningChange(value: string | number | boolean): void {
         </p>
       </div>
       <div class="page-head__actions">
+        <el-radio-group :model-value="crackStore.scope" size="small" @update:model-value="(v: 'current' | 'archived') => setScope(v)">
+          <el-radio-button value="current">当前环</el-radio-button>
+          <el-radio-button value="archived">已换环历史</el-radio-button>
+        </el-radio-group>
         <el-switch
           :model-value="crackStore.onlyWarning"
           active-text="仅看预警"
@@ -212,10 +229,24 @@ function onOnlyWarningChange(value: string | number | boolean): void {
     </div>
 
     <div class="stat-row">
-      <StatBadge label="裂缝总数" :value="crackStore.cracks.length" suffix="条" icon="Files" tone="primary" />
+      <StatBadge
+        :label="isArchivedScope ? '历史裂缝' : '当前裂缝'"
+        :value="isArchivedScope ? crackStore.archivedCracks.length : crackStore.currentCracks.length"
+        suffix="条"
+        icon="Files"
+        tone="primary"
+      />
       <StatBadge label="预警裂缝" :value="warningRows.length" suffix="条" icon="WarningFilled" tone="warning" />
       <StatBadge label="严重裂缝" :value="severeRows.length" suffix="条" icon="CircleCloseFilled" tone="danger" />
       <StatBadge label="平均月均速率" :value="averageRate.toFixed(3)" suffix="mm/月" icon="TrendCharts" tone="info" />
+      <StatBadge
+        v-if="!isArchivedScope"
+        label="历史留档预警"
+        :value="archivedWarningCount"
+        suffix="条"
+        icon="Grid"
+        tone="default"
+      />
     </div>
 
     <FilterBar
@@ -227,8 +258,14 @@ function onOnlyWarningChange(value: string | number | boolean): void {
 
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
-        <h3 class="panel-title">速率排行（{{ ranked.length }} / {{ crackStore.cracks.length }}）</h3>
-        <span class="muted">点击「曲线」查看该裂缝全部测次与建议状态</span>
+        <h3 class="panel-title">
+          {{ isArchivedScope ? '已换环历史速率排行' : '速率排行' }}（{{ ranked.length }} / {{ isArchivedScope ? crackStore.archivedCracks.length : crackStore.currentCracks.length }}）
+        </h3>
+        <span class="muted">
+          {{ isArchivedScope
+            ? '历史裂缝仅供追溯，不能生成或维护建议'
+            : '点击「曲线」查看该裂缝全部测次与建议状态' }}
+        </span>
       </div>
 
       <EmptyPanel
@@ -250,8 +287,11 @@ function onOnlyWarningChange(value: string | number | boolean): void {
         <el-table-column label="区间 / 里程" min-width="170">
           <template #default="{ row }">{{ row.sectionLabel }}</template>
         </el-table-column>
-        <el-table-column label="环号" width="96">
-          <template #default="{ row }">{{ row.ringLabel }}</template>
+        <el-table-column label="环号" width="130">
+          <template #default="{ row }">
+            {{ row.ringLabel }}
+            <el-tag v-if="row.archived" size="small" type="info" effect="plain">历史</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="部位/走向" width="110">
           <template #default="{ row }">{{ row.crack.position }} / {{ row.crack.direction }}</template>
@@ -296,7 +336,14 @@ function onOnlyWarningChange(value: string | number | boolean): void {
             <el-button size="small" text type="primary" @click="openDrawer(row)">
               <el-icon><View /></el-icon> 曲线
             </el-button>
-            <el-button size="small" text type="primary" :icon="MagicStick" @click="generateAdvice(row)">
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :icon="MagicStick"
+              :disabled="row.archived"
+              @click="generateAdvice(row)"
+            >
               生成建议
             </el-button>
             <el-button
@@ -304,7 +351,7 @@ function onOnlyWarningChange(value: string | number | boolean): void {
               text
               type="primary"
               :icon="Edit"
-              :disabled="!adviceOf(row.crack.id)"
+              :disabled="!adviceOf(row.crack.id) || row.archived"
               @click="openAdviceEdit(row)"
             >
               维护
@@ -314,7 +361,7 @@ function onOnlyWarningChange(value: string | number | boolean): void {
               text
               type="danger"
               :icon="Delete"
-              :disabled="!adviceOf(row.crack.id)"
+              :disabled="!adviceOf(row.crack.id) || row.archived"
               @click="removeAdvice(row)"
             >
               撤销
@@ -356,6 +403,14 @@ function onOnlyWarningChange(value: string | number | boolean): void {
 
     <el-drawer v-model="drawerVisible" :title="drawerCrack ? `${drawerCrack.crack.code} · 发展态势` : '裂缝详情'" size="620px">
       <template v-if="drawerCrack">
+        <el-alert
+          v-if="drawerCrack.archived"
+          type="info"
+          :closable="false"
+          show-icon
+          title="换环前历史裂缝：测次序列与速率为换环当时的留档数据，只读不可追加。"
+          style="margin-bottom: 10px"
+        />
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="区间">{{ drawerCrack.sectionLabel }}</el-descriptions-item>
           <el-descriptions-item label="环号">{{ drawerCrack.ringLabel }}</el-descriptions-item>

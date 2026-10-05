@@ -1,14 +1,17 @@
 /**
  * 复测测次状态（Pinia）
  * 维护测次顺序、变化量缓存与按裂缝汇总的发展速率。
+ * v3：追加/编辑/删除复测前校验所属环片仍在役；速率预警默认只统计当前环裂缝，
+ * 已换环留档裂缝的速率单独走历史口径。
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type SurveyRow } from '@/utils/db'
+import { assertRingWritableByCrack, db, type CrackRow, type SurveyRow } from '@/utils/db'
 import type { Survey, SurveyDraft } from '@/types/survey'
 import type { AdviceLevel } from '@/types/advice'
 import { buildSurveyPoints, levelFromRate, round } from '@/utils/rate'
+import { useSectionStore } from '@/stores/sectionStore'
 
 export interface CrackRateSummary {
   crackId: string
@@ -24,10 +27,15 @@ export interface CrackRateSummary {
   rate: number
   level: AdviceLevel
   lastDate: string
+  /** 裂缝所属环是否已换环留档 */
+  archived: boolean
 }
 
 export const useSurveyStore = defineStore('survey', () => {
   const surveyTable = useIdbTable<SurveyRow>((database) => database.surveys, { sortByUpdatedAt: false })
+  /** 直接订阅裂缝表，用于按环片生命周期区分当前/历史速率（避免与 crackStore 循环依赖） */
+  const crackTable = useIdbTable<CrackRow>((database) => database.cracks, { sortByUpdatedAt: false })
+  const sectionStore = useSectionStore()
 
   /** 正在查看的裂缝 id（复测对比页与速率分级页共用） */
   const activeCrackId = ref<string | null>(null)
@@ -39,6 +47,15 @@ export const useSurveyStore = defineStore('survey', () => {
       return a.seq - b.seq
     })
   )
+
+  /** crackId → 是否留档 */
+  const archivedCrackMap = computed(() => {
+    const map = new Map<string, boolean>()
+    crackTable.rows.value.forEach((crack) => {
+      map.set(crack.id, sectionStore.isRingArchived(crack.ringId))
+    })
+    return map
+  })
 
   function surveysOf(crackId: string): Survey[] {
     return surveys.value.filter((survey) => survey.crackId === crackId)
@@ -66,7 +83,8 @@ export const useSurveyStore = defineStore('survey', () => {
         totalDelta: round((latest ? latest.widthMm : 0) - (first ? first.widthMm : 0), 2),
         rate,
         level: levelFromRate(rate),
-        lastDate: latest ? latest.date : ''
+        lastDate: latest ? latest.date : '',
+        archived: archivedCrackMap.value.get(crackId) ?? false
       })
     })
     return list.sort((a, b) => b.rate - a.rate)
@@ -88,19 +106,34 @@ export const useSurveyStore = defineStore('survey', () => {
     return map
   })
 
-  const warningCrackIds = computed(() => rates.value.filter((item) => item.level !== '一般').map((item) => item.crackId))
+  /** 预警裂缝：只统计当前在役环上的裂缝，换环前历史预警不混入 */
+  const warningCrackIds = computed(() =>
+    rates.value.filter((item) => item.level !== '一般' && !item.archived).map((item) => item.crackId)
+  )
+
+  /** 历史留档裂缝中的预警数（仅信息展示） */
+  const archivedWarningCrackIds = computed(() =>
+    rates.value.filter((item) => item.level !== '一般' && item.archived).map((item) => item.crackId)
+  )
 
   const summaryOf = (crackId: string): CrackRateSummary | null =>
     rates.value.find((item) => item.crackId === crackId) ?? null
+
+  /** 判断裂缝是否属于已换环留档环（找不到裂缝按非留档处理） */
+  function isCrackArchived(crackId: string): boolean {
+    return archivedCrackMap.value.get(crackId) ?? false
+  }
 
   function setActiveCrack(id: string | null): void {
     activeCrackId.value = id
   }
 
   /**
-   * 追加一次复测读数：自动取下一个测次序号并与前一次比对生成变化量
+   * 追加一次复测读数：自动取下一个测次序号并与前一次比对生成变化量。
+   * 留档环裂缝禁止追加，避免换环前裂缝被新读数接上。
    */
   async function createSurvey(draft: SurveyDraft): Promise<SurveyRow> {
+    await assertRingWritableByCrack(draft.crackId, '追加复测')
     const existing = surveysOf(draft.crackId)
     const previous = existing.length > 0 ? existing[existing.length - 1] : null
     const seq = previous ? previous.seq + 1 : 1
@@ -121,8 +154,9 @@ export const useSurveyStore = defineStore('survey', () => {
     return row
   }
 
-  /** 编辑测次后重排序号并重算全部变化量 */
+  /** 编辑测次后重排序号并重算全部变化量（历史裂缝只读） */
   async function updateSurvey(id: string, draft: SurveyDraft): Promise<void> {
+    await assertRingWritableByCrack(draft.crackId, '编辑复测')
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
     await surveyTable.update(id, {
@@ -137,6 +171,7 @@ export const useSurveyStore = defineStore('survey', () => {
   async function removeSurvey(id: string): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
+    await assertRingWritableByCrack(row.crackId, '删除复测')
     await surveyTable.remove(id)
     await recalculate(row.crackId)
   }
@@ -169,14 +204,17 @@ export const useSurveyStore = defineStore('survey', () => {
 
   return {
     surveyTable,
+    crackTable,
     surveys,
     rates,
     rateMap,
     levelMap,
     warningCrackIds,
+    archivedWarningCrackIds,
     activeCrackId,
     surveysOf,
     summaryOf,
+    isCrackArchived,
     setActiveCrack,
     createSurvey,
     updateSurvey,

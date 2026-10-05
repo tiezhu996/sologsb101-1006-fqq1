@@ -82,6 +82,12 @@ function crackOf(crackId: string) {
   return crackStore.cracks.find((crack) => crack.id === crackId) ?? null
 }
 
+/** 建议关联裂缝所属环是否已换环留档（历史建议只读） */
+function isAdviceArchived(advice: AdviceRow): boolean {
+  const crack = crackOf(advice.crackId)
+  return crack ? sectionStore.isRingArchived(crack.ringId) : false
+}
+
 const rows = computed(() =>
   adviceTable.rows.value
     .filter((advice) => {
@@ -116,7 +122,7 @@ const rules: FormRules = {
 }
 
 const crackOptions = computed(() =>
-  crackStore.cracks.map((crack) => {
+  crackStore.currentCracks.map((crack) => {
     const ring = sectionStore.ringById.get(crack.ringId)
     const section = sectionStore.sectionById.get(crack.sectionId)
     return {
@@ -129,7 +135,7 @@ const crackOptions = computed(() =>
 function openCreate(): void {
   editingId = null
   dialogTitle.value = '新建整治建议'
-  const fallback = crackStore.cracks[0]
+  const fallback = crackStore.currentCracks[0]
   Object.assign(form, {
     ...EMPTY_ADVICE_DRAFT,
     crackId: fallback ? fallback.id : '',
@@ -168,6 +174,10 @@ async function submit(): Promise<void> {
 }
 
 async function removeAdvice(advice: AdviceRow): Promise<void> {
+  if (isAdviceArchived(advice)) {
+    ElMessage.warning('该建议属于换环前留档裂缝，历史记录只读')
+    return
+  }
   const confirmed = await ElMessageBox.confirm(
     `确认删除「${crackOf(advice.crackId)?.code ?? '该裂缝'}」的整治建议？`,
     '删除确认',
@@ -180,6 +190,10 @@ async function removeAdvice(advice: AdviceRow): Promise<void> {
 }
 
 async function advance(advice: AdviceRow): Promise<void> {
+  if (isAdviceArchived(advice)) {
+    ElMessage.warning('该建议属于换环前留档裂缝，历史记录只读')
+    return
+  }
   const next = ADVICE_STATE_FLOW[advice.state]
   if (!next) {
     ElMessage.info('该建议已完成闭环')
@@ -233,9 +247,13 @@ async function onFileChange(event: Event): Promise<void> {
       { type: 'warning', confirmButtonText: '覆盖导入', cancelButtonText: '取消' }
     ).catch(() => false)
     if (!confirmed) return
-    await importSnapshot(payload)
-    ElMessage.success('存档已导入')
-    await refreshCounts()
+    try {
+      await importSnapshot(payload)
+      ElMessage.success('存档已导入（已兼容旧版备份：环片版本与引用完整性均已校验）')
+      await refreshCounts()
+    } catch (error) {
+      ElMessage.error(`导入失败：${error instanceof Error ? error.message : '未知错误'}`)
+    }
   } catch (error) {
     ElMessage.error(`导入失败：${error instanceof Error ? error.message : '未知错误'}`)
   } finally {
@@ -269,14 +287,15 @@ async function reseed(): Promise<void> {
 }
 
 async function exportCsv(): Promise<void> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, replacements] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.replacements.toArray()
   ])
-  const filename = exportCrackCsv(sections, rings, cracks, surveys, advices)
+  const filename = exportCrackCsv(sections, rings, cracks, surveys, advices, replacements)
   ElMessage.success(`已导出 ${filename}`)
 }
 
@@ -298,7 +317,7 @@ function adviceRowKey(row: AdviceRow): string {
       </div>
       <div class="page-head__actions">
         <el-button :icon="Download" @click="exportCsv">导出裂缝台账 CSV</el-button>
-        <el-button type="primary" :icon="Plus" :disabled="crackStore.cracks.length === 0" @click="openCreate">
+        <el-button type="primary" :icon="Plus" :disabled="crackStore.currentCracks.length === 0" @click="openCreate">
           新建建议
         </el-button>
       </div>
@@ -330,15 +349,18 @@ function adviceRowKey(row: AdviceRow): string {
         description="可在「速率分级」页按速率一键生成建议草稿，也可在此手工新建。"
         action-text="新建建议"
         compact
-        :show-seed="crackStore.cracks.length === 0"
+        :show-seed="crackStore.currentCracks.length === 0"
         @action="openCreate"
         @seed="reseed"
       />
 
       <el-table v-else :data="rows" border stripe :row-key="adviceRowKey">
-        <el-table-column label="裂缝编号" width="140">
+        <el-table-column label="裂缝编号" width="170">
           <template #default="{ row }">
             <strong>{{ crackOf(row.crackId)?.code ?? '（裂缝已删除）' }}</strong>
+            <el-tag v-if="isAdviceArchived(row)" size="small" type="info" effect="plain" style="margin-left: 4px">
+              换环历史
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="月均速率" width="130">
@@ -374,14 +396,20 @@ function adviceRowKey(row: AdviceRow): string {
         </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text type="primary" @click="openEdit(row)">
+            <el-button size="small" text type="primary" :disabled="isAdviceArchived(row)" @click="openEdit(row)">
               <el-icon><Edit /></el-icon> 编辑
             </el-button>
-            <el-button size="small" text type="primary" :disabled="!ADVICE_STATE_FLOW[row.state as AdviceState]" @click="advance(row)">
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :disabled="!ADVICE_STATE_FLOW[row.state as AdviceState] || isAdviceArchived(row)"
+              @click="advance(row)"
+            >
               <el-icon><Right /></el-icon>
               {{ ADVICE_STATE_FLOW[row.state as AdviceState] ? `转${ADVICE_STATE_FLOW[row.state as AdviceState]}` : '已闭环' }}
             </el-button>
-            <el-button size="small" text type="danger" @click="removeAdvice(row)">
+            <el-button size="small" text type="danger" :disabled="isAdviceArchived(row)" @click="removeAdvice(row)">
               <el-icon><Delete /></el-icon> 删除
             </el-button>
           </template>
@@ -402,6 +430,9 @@ function adviceRowKey(row: AdviceRow): string {
           {{ counts.cracks ?? 0 }} / {{ counts.surveys ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="整治建议">{{ counts.advices ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="换环单">
+          {{ counts.replacements ?? 0 }} 张（含留档环片，会随 JSON 备份一并导出/校验导入）
+        </el-descriptions-item>
       </el-descriptions>
 
       <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px">

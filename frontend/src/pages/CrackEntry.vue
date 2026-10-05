@@ -74,7 +74,7 @@ function onFilterChange(model: FilterModel): void {
 /* ---------------------------- 环片下拉 ---------------------------- */
 
 const ringOptions = computed(() =>
-  sectionStore.rings.map((ring) => {
+  sectionStore.currentRings.map((ring) => {
     const section = sectionStore.sectionById.get(ring.sectionId)
     return {
       label: `${section ? section.line : '未知线路'} · 第 ${ring.ringNo} 环 · ${formatMileage(ring.mileage)}`,
@@ -104,7 +104,7 @@ function openCreate(): void {
   Object.assign(form, {
     ...EMPTY_CRACK_DRAFT,
     ringId: crackStore.filter.sectionId
-      ? sectionStore.rings.find((ring) => ring.sectionId === crackStore.filter.sectionId)?.id ?? ''
+      ? sectionStore.currentRings.find((ring) => ring.sectionId === crackStore.filter.sectionId)?.id ?? ''
       : ringOptions.value[0]?.value ?? ''
   })
   dialogVisible.value = true
@@ -130,14 +130,18 @@ async function submit(): Promise<void> {
   if (!instance) return
   const valid = await instance.validate().catch(() => false)
   if (!valid) return
-  if (editingId) {
-    await crackStore.updateCrack(editingId, { ...form })
-    ElMessage.success('裂缝档案已更新')
-  } else {
-    await crackStore.createCrack({ ...form })
-    ElMessage.success('裂缝已建档，可前往复测对比页追加测次')
+  try {
+    if (editingId) {
+      await crackStore.updateCrack(editingId, { ...form })
+      ElMessage.success('裂缝档案已更新')
+    } else {
+      await crackStore.createCrack({ ...form })
+      ElMessage.success('裂缝已建档，可前往复测对比页追加测次')
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function remove(crack: Crack): Promise<void> {
@@ -147,8 +151,12 @@ async function remove(crack: Crack): Promise<void> {
     { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await crackStore.removeCrack(crack.id)
-  ElMessage.success('裂缝及其下游数据已删除')
+  try {
+    await crackStore.removeCrack(crack.id)
+    ElMessage.success('裂缝及其下游数据已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 /* -------------------------- 批量与状态流转 -------------------------- */
@@ -166,12 +174,16 @@ async function applyBulkState(): Promise<void> {
     ElMessage.warning('请先勾选裂缝')
     return
   }
-  await crackStore.bulkSetState(
-    selectedRows.value.map((row) => row.crack.id),
-    bulkState.value
-  )
-  ElMessage.success(`已将 ${selectedRows.value.length} 条裂缝置为「${bulkState.value}」`)
-  selectedRows.value = []
+  try {
+    await crackStore.bulkSetState(
+      selectedRows.value.map((row) => row.crack.id),
+      bulkState.value
+    )
+    ElMessage.success(`已将 ${selectedRows.value.length} 条裂缝置为「${bulkState.value}」`)
+    selectedRows.value = []
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '批量操作失败')
+  }
 }
 
 const nextStateOf = (state: CrackState): CrackState | null => CRACK_STATE_FLOW[state]
@@ -182,21 +194,26 @@ async function advance(crack: Crack): Promise<void> {
     ElMessage.info('该裂缝已完成整治，无需再流转')
     return
   }
-  await crackStore.setState(crack.id, next)
-  ElMessage.success(`${crack.code} 状态已推进为「${next}」`)
+  try {
+    await crackStore.setState(crack.id, next)
+    ElMessage.success(`${crack.code} 状态已推进为「${next}」`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '状态流转失败')
+  }
 }
 
 /* ------------------------------ 导出 ------------------------------ */
 
 async function exportCsv(): Promise<void> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, replacements] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.replacements.toArray()
   ])
-  const filename = exportCrackCsv(sections, rings, cracks, surveys, advices)
+  const filename = exportCrackCsv(sections, rings, cracks, surveys, advices, replacements)
   ElMessage.success(`已导出 ${filename}`)
 }
 
@@ -206,7 +223,14 @@ const rows = computed(() => crackStore.filtered)
 
 const warningRows = computed(() => rows.value.filter((row) => row.level !== '一般'))
 
+const isArchivedScope = computed(() => crackStore.scope === 'archived')
+
+function setScope(scope: 'current' | 'archived'): void {
+  crackStore.setScope(scope)
+}
+
 function rowClassName({ row }: { row: CrackEnriched }): string {
+  if (row.archived) return 'row-archived'
   return row.level === '严重' ? 'row-severe' : ''
 }
 
@@ -225,23 +249,27 @@ function latestDateOf(crackId: string): string {
       <div>
         <h2 class="page-head__title">裂缝初测录入</h2>
         <p class="page-head__desc">
-          按环片登记裂缝部位、走向与初测尺寸；支持勾选批量改状态、单条状态流转与台账 CSV 导出。
+          按环片登记裂缝部位、走向与初测尺寸；支持勾选批量改状态、单条状态流转与台账 CSV 导出。换环前裂缝在「已换环历史」中只读可查。
         </p>
       </div>
       <div class="page-head__actions">
+        <el-radio-group :model-value="crackStore.scope" size="small" @update:model-value="(v: 'current' | 'archived') => setScope(v)">
+          <el-radio-button value="current">当前裂缝</el-radio-button>
+          <el-radio-button value="archived">已换环历史（{{ crackStore.archivedCount }}）</el-radio-button>
+        </el-radio-group>
         <el-button :icon="Download" @click="exportCsv">导出裂缝台账 CSV</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增裂缝</el-button>
+        <el-button type="primary" :icon="Plus" :disabled="isArchivedScope" @click="openCreate">新增裂缝</el-button>
       </div>
     </div>
 
     <div class="stat-row">
-      <StatBadge label="裂缝总数" :value="crackStore.cracks.length" suffix="条" icon="Files" tone="primary" />
+      <StatBadge label="当前裂缝" :value="crackStore.currentCracks.length" suffix="条" icon="Files" tone="primary" />
       <StatBadge label="待整治" :value="crackStore.waitingCount" suffix="条" icon="Histogram" tone="warning" />
       <StatBadge label="已整治" :value="crackStore.stateCounts['已整治']" suffix="条" icon="Grid" tone="success" />
       <StatBadge
         label="预警占比"
         :value="crackStore.warningCount"
-        :percent="crackStore.cracks.length === 0 ? 0 : crackStore.warningPercent"
+        :percent="crackStore.currentCracks.length === 0 ? 0 : crackStore.warningPercent"
         icon="WarningFilled"
         tone="danger"
       />
@@ -254,19 +282,28 @@ function latestDateOf(crackId: string): string {
       @change="onFilterChange"
     >
       <template #actions>
-        <el-select v-model="bulkState" style="width: 128px" size="default">
-          <el-option v-for="item in crackStore.stateOptions" :key="item" :label="item" :value="item" />
-        </el-select>
-        <el-button type="primary" plain :icon="Refresh" @click="applyBulkState">
-          批量改状态（{{ selectedRows.length }}）
-        </el-button>
+        <template v-if="!isArchivedScope">
+          <el-select v-model="bulkState" style="width: 128px" size="default">
+            <el-option v-for="item in crackStore.stateOptions" :key="item" :label="item" :value="item" />
+          </el-select>
+          <el-button type="primary" plain :icon="Refresh" @click="applyBulkState">
+            批量改状态（{{ selectedRows.length }}）
+          </el-button>
+        </template>
+        <el-tag v-else type="info" effect="plain">历史裂缝为换环前留档记录，只读</el-tag>
       </template>
     </FilterBar>
 
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
-        <h3 class="panel-title">裂缝清单（{{ rows.length }} / {{ crackStore.cracks.length }}）</h3>
-        <span class="muted">预警裂缝 {{ warningRows.length }} 条，红色行表示速率已达严重级</span>
+        <h3 class="panel-title">
+          {{ isArchivedScope ? '已换环历史裂缝' : '裂缝清单' }}（{{ rows.length }} / {{ isArchivedScope ? crackStore.archivedCracks.length : crackStore.currentCracks.length }}）
+        </h3>
+        <span class="muted">
+          {{ isArchivedScope
+            ? '换环前裂缝与全部复测仍按原环片可查，但不会挂到同环号新环片'
+            : '预警裂缝 ' + warningRows.length + ' 条，红色行表示速率已达严重级' }}
+        </span>
       </div>
 
       <EmptyPanel
@@ -289,7 +326,7 @@ function latestDateOf(crackId: string): string {
         :row-class-name="rowClassName"
         @selection-change="onSelectionChange"
       >
-        <el-table-column type="selection" width="46" />
+        <el-table-column v-if="!isArchivedScope" type="selection" width="46" />
         <el-table-column label="裂缝编号" width="140">
           <template #default="{ row }">
             <strong>{{ row.crack.code }}</strong>
@@ -298,8 +335,11 @@ function latestDateOf(crackId: string): string {
         <el-table-column label="区间 / 里程" min-width="180">
           <template #default="{ row }">{{ row.sectionLabel }}</template>
         </el-table-column>
-        <el-table-column label="环号" width="100">
-          <template #default="{ row }">{{ row.ringLabel }}</template>
+        <el-table-column label="环号" width="130">
+          <template #default="{ row }">
+            {{ row.ringLabel }}
+            <el-tag v-if="row.archived" size="small" type="info" effect="plain">历史</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="部位" width="86">
           <template #default="{ row }">{{ row.crack.position }}</template>
@@ -334,12 +374,13 @@ function latestDateOf(crackId: string): string {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" :width="isArchivedScope ? 120 : 240" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text type="primary" @click="openEdit(row.crack)">
+            <el-button v-if="!row.archived" size="small" text type="primary" @click="openEdit(row.crack)">
               <el-icon><Edit /></el-icon> 编辑
             </el-button>
             <el-button
+              v-if="!row.archived"
               size="small"
               text
               type="primary"
@@ -349,9 +390,10 @@ function latestDateOf(crackId: string): string {
               <el-icon><Right /></el-icon>
               {{ nextStateOf(row.crack.state) ? `转${nextStateOf(row.crack.state)}` : '已完成' }}
             </el-button>
-            <el-button size="small" text type="danger" @click="remove(row.crack)">
+            <el-button v-if="!row.archived" size="small" text type="danger" @click="remove(row.crack)">
               <el-icon><Delete /></el-icon> 删除
             </el-button>
+            <el-tag v-else size="small" type="info" effect="plain">换环前留档 · 只读</el-tag>
           </template>
         </el-table-column>
       </el-table>
@@ -425,5 +467,10 @@ function latestDateOf(crackId: string): string {
 
 :deep(.row-severe) {
   background: #fdecea !important;
+}
+
+:deep(.row-archived) {
+  background: #f5f6f8 !important;
+  color: #8c99ab;
 }
 </style>

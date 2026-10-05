@@ -1,5 +1,5 @@
 /**
- * 路由表：/sections、/cracks、/surveys、/trends、/backup
+ * 路由表：/sections、/replacements、/cracks、/surveys、/trends、/backup
  * 页面按路由懒加载，构建时自动分包。
  */
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
@@ -11,6 +11,12 @@ const routes: RouteRecordRaw[] = [
     name: 'section-list',
     component: () => import('@/pages/SectionList.vue'),
     meta: { title: '区间与环片里程台账', icon: 'Files' }
+  },
+  {
+    path: '/replacements',
+    name: 'ring-replace',
+    component: () => import('@/pages/RingReplace.vue'),
+    meta: { title: '换环管理', icon: 'Switch' }
   },
   {
     path: '/cracks',

@@ -60,6 +60,16 @@ function onFilterChange(model: FilterModel): void {
 
 const candidateCracks = computed(() => crackStore.filtered)
 
+function setScope(scope: 'current' | 'archived'): void {
+  crackStore.setScope(scope)
+  surveyStore.setActiveCrack(null)
+}
+
+/** 当前选中裂缝是否属于留档环（历史只读） */
+const activeArchived = computed(() =>
+  activeCrackId.value ? surveyStore.isCrackArchived(activeCrackId.value) : false
+)
+
 /* ------------------------------ 折线图 ------------------------------ */
 
 const chart = computed(() => {
@@ -114,6 +124,10 @@ function openCreate(): void {
     ElMessage.warning('请先在左侧选择一条裂缝')
     return
   }
+  if (activeArchived.value) {
+    ElMessage.warning('该裂缝属于换环前留档环，复测记录只读，不能追加新测次')
+    return
+  }
   editingId = null
   dialogTitle.value = `追加测次 · ${activeCrack.value?.crack.code ?? ''}`
   const previous = trend.latest.value
@@ -147,14 +161,18 @@ async function submit(): Promise<void> {
   if (!instance) return
   const valid = await instance.validate().catch(() => false)
   if (!valid) return
-  if (editingId) {
-    await surveyStore.updateSurvey(editingId, { ...form })
-    ElMessage.success('测次已更新，变化量与速率已重新计算')
-  } else {
-    await surveyStore.createSurvey({ ...form })
-    ElMessage.success('测次已追加，变化量已自动比对')
+  try {
+    if (editingId) {
+      await surveyStore.updateSurvey(editingId, { ...form })
+      ElMessage.success('测次已更新，变化量与速率已重新计算')
+    } else {
+      await surveyStore.createSurvey({ ...form })
+      ElMessage.success('测次已追加，变化量已自动比对')
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function removeSurvey(surveyId: string, seq: number): Promise<void> {
@@ -164,8 +182,12 @@ async function removeSurvey(surveyId: string, seq: number): Promise<void> {
     cancelButtonText: '取消'
   }).catch(() => false)
   if (!confirmed) return
-  await surveyStore.removeSurvey(surveyId)
-  ElMessage.success('测次已删除')
+  try {
+    await surveyStore.removeSurvey(surveyId)
+    ElMessage.success('测次已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 function selectCrack(crackId: string): void {
@@ -179,18 +201,22 @@ function selectCrack(crackId: string): void {
       <div>
         <h2 class="page-head__title">复测测次与变化量对比</h2>
         <p class="page-head__desc">
-          选定裂缝后按测次追加读数，系统自动与上一测次比对生成变化量并换算月均速率。
+          选定裂缝后按测次追加读数，系统自动与上一测次比对生成变化量并换算月均速率。换环前历史裂缝只可查看。
         </p>
       </div>
       <div class="page-head__actions">
-        <el-button type="primary" :icon="Plus" :disabled="!activeCrackId" @click="openCreate">追加测次</el-button>
+        <el-radio-group :model-value="crackStore.scope" size="small" @update:model-value="(v: 'current' | 'archived') => setScope(v)">
+          <el-radio-button value="current">当前环裂缝</el-radio-button>
+          <el-radio-button value="archived">已换环历史</el-radio-button>
+        </el-radio-group>
+        <el-button type="primary" :icon="Plus" :disabled="!activeCrackId || activeArchived" @click="openCreate">追加测次</el-button>
       </div>
     </div>
 
     <div class="stat-row">
       <StatBadge label="测次总数" :value="surveyStore.surveys.length" suffix="次" icon="DataLine" tone="primary" />
-      <StatBadge label="已复测裂缝" :value="surveyStore.rates.length" suffix="条" icon="Files" tone="info" />
-      <StatBadge label="预警裂缝" :value="surveyStore.warningCrackIds.length" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="当前预警裂缝" :value="surveyStore.warningCrackIds.length" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="历史预警(留档)" :value="surveyStore.archivedWarningCrackIds.length" suffix="条" icon="Files" tone="info" />
       <StatBadge
         label="最高月均速率"
         :value="surveyStore.rates.length > 0 ? surveyStore.rates[0].rate.toFixed(3) : '0.000'"
@@ -225,7 +251,8 @@ function selectCrack(crackId: string): void {
         >
           <div class="section-card__head">
             <span class="section-card__title">{{ item.crack.code }}</span>
-            <LevelTag :level="item.level" size="small" />
+            <LevelTag v-if="!item.archived" :level="item.level" size="small" />
+            <el-tag v-else size="small" type="info" effect="plain">历史</el-tag>
           </div>
           <div class="section-card__meta">
             <span>{{ item.sectionLabel }}</span>
@@ -245,6 +272,9 @@ function selectCrack(crackId: string): void {
             <h3 class="panel-title">
               {{ activeCrack.crack.code }} · 宽度发展曲线
               <span class="muted">{{ activeCrack.sectionLabel }} / {{ activeCrack.ringLabel }}</span>
+              <el-tag v-if="activeCrack.archived" size="small" type="info" effect="plain" style="margin-left: 6px">
+                换环前历史 · 只读
+              </el-tag>
             </h3>
             <div style="display: flex; align-items: center; gap: 8px">
               <span class="muted">
@@ -253,6 +283,15 @@ function selectCrack(crackId: string): void {
               <LevelTag :level="trend.level.value" :rate="trend.rate.value" />
             </div>
           </div>
+
+          <el-alert
+            v-if="activeCrack.archived"
+            type="info"
+            :closable="false"
+            show-icon
+            title="该裂缝属于换环前留档环：全部复测记录仍按原环片可查，但不能再追加或修改读数；同环号新环的裂缝从零建档，与此曲线不连续。"
+            style="margin-bottom: 10px"
+          />
 
           <div v-if="!chart" class="empty-panel is-compact">
             <p class="empty-panel__desc">该裂缝还没有复测记录，点击「追加测次」录入第一条读数。</p>
@@ -314,12 +353,15 @@ function selectCrack(crackId: string): void {
             <el-table-column prop="surveyor" label="复测人" width="100" />
             <el-table-column label="操作" width="140">
               <template #default="{ row }">
-                <el-button size="small" text type="primary" @click="openEdit(row.id)">
-                  <el-icon><Edit /></el-icon>
-                </el-button>
-                <el-button size="small" text type="danger" @click="removeSurvey(row.id, row.seq)">
-                  <el-icon><Delete /></el-icon>
-                </el-button>
+                <template v-if="!activeCrack.archived">
+                  <el-button size="small" text type="primary" @click="openEdit(row.id)">
+                    <el-icon><Edit /></el-icon>
+                  </el-button>
+                  <el-button size="small" text type="danger" @click="removeSurvey(row.id, row.seq)">
+                    <el-icon><Delete /></el-icon>
+                  </el-button>
+                </template>
+                <span v-else class="muted">留档只读</span>
               </template>
             </el-table-column>
           </el-table>
