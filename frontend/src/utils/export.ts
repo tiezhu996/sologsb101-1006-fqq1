@@ -9,6 +9,7 @@ import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
 import { formatMileage } from '@/types/section'
 import { buildSurveyPoints } from '@/utils/rate'
+import { isArchivedRing } from '@/types/ring'
 
 /** 触发浏览器下载 */
 export function download(filename: string, content: string, mime: string): void {
@@ -50,6 +51,9 @@ export function exportCrackCsv(
     '区间起里程',
     '区间止里程',
     '环号',
+    '环片世代',
+    '环片状态',
+    '换环日期',
     '里程',
     '裂缝编号',
     '部位',
@@ -70,12 +74,16 @@ export function exportCrackCsv(
     const section = sections.find((item) => item.id === crack.sectionId)
     const points = buildSurveyPoints(surveys.filter((survey) => survey.crackId === crack.id))
     const advice = advices.find((item) => item.crackId === crack.id)
+    const archived = isArchivedRing(ring)
     lines.push(
       [
         section ? section.line : '—',
         section ? formatMileage(section.startMileage) : '—',
         section ? formatMileage(section.endMileage) : '—',
         ring ? ring.ringNo : '—',
+        ring ? `第${ring.generation ?? 1}代` : '—',
+        archived ? '已换环（历史留档）' : '当前环',
+        archived && ring?.replacedDate ? ring.replacedDate : '—',
         ring ? formatMileage(ring.mileage) : '—',
         crack.code,
         crack.position,

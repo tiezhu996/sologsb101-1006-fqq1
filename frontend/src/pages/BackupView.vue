@@ -60,6 +60,8 @@ async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
 }
 
+const archivedRingTotal = computed(() => sectionStore.archivedRings.length)
+
 /* ------------------------------ 筛选 ------------------------------ */
 
 const filterModel = computed<FilterModel>(() => ({
@@ -80,6 +82,14 @@ function onFilterChange(model: FilterModel): void {
 
 function crackOf(crackId: string) {
   return crackStore.cracks.find((crack) => crack.id === crackId) ?? null
+}
+
+/** 建议所属裂缝是否在已换环上（历史只读） */
+function isArchivedAdvice(advice: AdviceRow): boolean {
+  const crack = crackOf(advice.crackId)
+  if (!crack) return false
+  const ring = sectionStore.ringById.get(crack.ringId)
+  return !!ring && ring.status === 'archived'
 }
 
 const rows = computed(() =>
@@ -116,11 +126,11 @@ const rules: FormRules = {
 }
 
 const crackOptions = computed(() =>
-  crackStore.cracks.map((crack) => {
+  crackStore.currentCracks.map((crack) => {
     const ring = sectionStore.ringById.get(crack.ringId)
     const section = sectionStore.sectionById.get(crack.sectionId)
     return {
-      label: `${crack.code} · ${section ? section.line : '未知'}${ring ? ` 第${ring.ringNo}环` : ''} · 当前 ${crack.widthMm.toFixed(2)} mm`,
+      label: `${crack.code} · ${section ? section.line : '未知'}${ring ? ` 第${ring.ringNo}环${ring.generation && ring.generation > 1 ? `(第${ring.generation}代)` : ''}` : ''} · 当前 ${crack.widthMm.toFixed(2)} mm`,
       value: crack.id
     }
   })
@@ -129,7 +139,7 @@ const crackOptions = computed(() =>
 function openCreate(): void {
   editingId = null
   dialogTitle.value = '新建整治建议'
-  const fallback = crackStore.cracks[0]
+  const fallback = crackStore.currentCracks[0]
   Object.assign(form, {
     ...EMPTY_ADVICE_DRAFT,
     crackId: fallback ? fallback.id : '',
@@ -168,6 +178,10 @@ async function submit(): Promise<void> {
 }
 
 async function removeAdvice(advice: AdviceRow): Promise<void> {
+  if (isArchivedAdvice(advice)) {
+    ElMessage.warning('该建议属于已换环历史档案，随原环留档不能删除')
+    return
+  }
   const confirmed = await ElMessageBox.confirm(
     `确认删除「${crackOf(advice.crackId)?.code ?? '该裂缝'}」的整治建议？`,
     '删除确认',
@@ -336,9 +350,12 @@ function adviceRowKey(row: AdviceRow): string {
       />
 
       <el-table v-else :data="rows" border stripe :row-key="adviceRowKey">
-        <el-table-column label="裂缝编号" width="140">
+        <el-table-column label="裂缝编号" width="170">
           <template #default="{ row }">
             <strong>{{ crackOf(row.crackId)?.code ?? '（裂缝已删除）' }}</strong>
+            <el-tag v-if="isArchivedAdvice(row)" size="small" type="info" effect="plain" style="margin-left: 4px">
+              已换环历史
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="月均速率" width="130">
@@ -374,14 +391,20 @@ function adviceRowKey(row: AdviceRow): string {
         </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text type="primary" @click="openEdit(row)">
+            <el-button size="small" text type="primary" :disabled="isArchivedAdvice(row)" @click="openEdit(row)">
               <el-icon><Edit /></el-icon> 编辑
             </el-button>
-            <el-button size="small" text type="primary" :disabled="!ADVICE_STATE_FLOW[row.state as AdviceState]" @click="advance(row)">
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :disabled="!ADVICE_STATE_FLOW[row.state as AdviceState] || isArchivedAdvice(row)"
+              @click="advance(row)"
+            >
               <el-icon><Right /></el-icon>
               {{ ADVICE_STATE_FLOW[row.state as AdviceState] ? `转${ADVICE_STATE_FLOW[row.state as AdviceState]}` : '已闭环' }}
             </el-button>
-            <el-button size="small" text type="danger" @click="removeAdvice(row)">
+            <el-button size="small" text type="danger" :disabled="isArchivedAdvice(row)" @click="removeAdvice(row)">
               <el-icon><Delete /></el-icon> 删除
             </el-button>
           </template>
@@ -395,8 +418,11 @@ function adviceRowKey(row: AdviceRow): string {
         <el-descriptions-item label="IndexedDB 库名">gbtunnelcrack</el-descriptions-item>
         <el-descriptions-item label="数据结构版本">v{{ DB_VERSION }}（localStorage 记录 v{{ stampedVersion }}）</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">{{ lastBackupAt ?? '尚未备份' }}</el-descriptions-item>
-        <el-descriptions-item label="区间 / 环片">
-          {{ counts.sections ?? 0 }} / {{ counts.rings ?? 0 }}
+        <el-descriptions-item label="区间 / 当前环">
+          {{ counts.sections ?? 0 }} / {{ (counts.rings ?? 0) - archivedRingTotal }}
+        </el-descriptions-item>
+        <el-descriptions-item label="已换环留档 / 换环单">
+          {{ archivedRingTotal }} / {{ counts.replacements ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="裂缝 / 复测">
           {{ counts.cracks ?? 0 }} / {{ counts.surveys ?? 0 }}

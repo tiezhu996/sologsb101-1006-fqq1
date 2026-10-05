@@ -10,12 +10,13 @@ import type { Ring } from '@/types/ring'
 import type { Crack } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { Replacement } from '@/types/replacement'
 
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbtunnelcrack'
 
 /** 当前数据结构版本号：调整表结构必须递增并补 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键名 */
 export const LS_KEYS = {
@@ -34,7 +35,7 @@ export const DEFAULT_UI_PREFS: UiPrefs = {
   trendOnlyWarning: false
 }
 
-/** 整库备份文件结构 */
+/** 整库备份文件结构（v3 起含 replacements；v1/v2 旧备份无该字段，导入时按空兼容升级） */
 export interface BackupPayload {
   app: 'gbtunnelcrack'
   dbVersion: number
@@ -44,6 +45,7 @@ export interface BackupPayload {
   cracks: Crack[]
   surveys: Survey[]
   advices: Advice[]
+  replacements?: Replacement[]
 }
 
 /** 带行修订号的持久化实体，便于逐行迁移 */
@@ -52,13 +54,14 @@ export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type SectionRow = Section & Revisioned
 export type RingRow = Ring & Revisioned
 export type CrackRow = Crack & Revisioned
 export type SurveyRow = Survey & Revisioned
 export type AdviceRow = Advice & Revisioned
+export type ReplacementRow = Replacement & Revisioned
 
 class TunnelCrackDatabase extends Dexie {
   sections!: Table<SectionRow, string>
@@ -66,6 +69,7 @@ class TunnelCrackDatabase extends Dexie {
   cracks!: Table<CrackRow, string>
   surveys!: Table<SurveyRow, string>
   advices!: Table<AdviceRow, string>
+  replacements!: Table<ReplacementRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -80,7 +84,7 @@ class TunnelCrackDatabase extends Dexie {
     })
 
     // v2：裂缝补充 sectionId 冗余列（按区间筛选/统计免联表）；复测补充 surveyor 索引；建议补充 note 字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         sections: 'id, line, structureType, startMileage, updatedAt',
         rings: 'id, sectionId, ringNo, mileage, segmentType, updatedAt',
@@ -99,7 +103,7 @@ class TunnelCrackDatabase extends Dexie {
         ]
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION
+            row.revision = 2
           })
         }
 
@@ -123,6 +127,47 @@ class TunnelCrackDatabase extends Dexie {
           .modify((survey: Record<string, unknown>) => {
             if (typeof survey.deltaWidthMm !== 'number' || !Number.isFinite(survey.deltaWidthMm)) {
               survey.deltaWidthMm = 0
+            }
+          })
+      })
+
+    // v3：换环版本——新增 replacements 换环单表；rings 补充 status/generation/血缘链索引
+    this.version(DB_VERSION)
+      .stores({
+        sections: 'id, line, structureType, startMileage, updatedAt',
+        rings:
+          'id, sectionId, ringNo, mileage, segmentType, status, generation, lineageId, replacedById, replacementId, updatedAt',
+        cracks: 'id, ringId, sectionId, code, position, direction, state, updatedAt',
+        surveys: 'id, crackId, seq, date, surveyor, updatedAt',
+        advices: 'id, crackId, level, measure, state, updatedAt',
+        replacements: 'id, oldRingId, newRingId, status, replaceDate, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：业务行修订号升到 v3（含新换环单表）
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('sections'),
+          tx.table('rings'),
+          tx.table('cracks'),
+          tx.table('surveys'),
+          tx.table('advices'),
+          tx.table('replacements')
+        ]
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION
+          })
+        }
+
+        // 迁移 2：既有环片全部视为当前环首环，补齐世代与血缘链。
+        // 裂缝/复测不动：历史记录仍挂在原环片 id 上，绝不因升级错挂。
+        await tx
+          .table('rings')
+          .toCollection()
+          .modify((ring: Record<string, unknown>) => {
+            if (ring.status !== 'archived') ring.status = 'current'
+            if (typeof ring.generation !== 'number' || ring.generation < 1) ring.generation = 1
+            if (typeof ring.lineageId !== 'string' || ring.lineageId.length === 0) {
+              ring.lineageId = String(ring.id)
             }
           })
       })
@@ -171,14 +216,48 @@ const SEED_SECTIONS: SectionRow[] = [
 ]
 
 const SEED_RINGS: RingRow[] = [
-  { id: 'ring-1', sectionId: 'sec-1', ringNo: 118, mileage: 12300, segmentType: '钢筋混凝土', installDate: '2016-04-18', createdAt: stamp(-118), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'ring-2', sectionId: 'sec-1', ringNo: 132, mileage: 12468, segmentType: '钢筋混凝土', installDate: '2016-05-02', createdAt: stamp(-117), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'ring-3', sectionId: 'sec-1', ringNo: 145, mileage: 12625, segmentType: '铸铁', installDate: '2016-06-11', createdAt: stamp(-116), updatedAt: stamp(-5), revision: ROW_REVISION },
-  { id: 'ring-4', sectionId: 'sec-2', ringNo: 27, mileage: 5080, segmentType: '钢筋混凝土', installDate: '2019-09-23', createdAt: stamp(-95), updatedAt: stamp(-4), revision: ROW_REVISION },
-  { id: 'ring-5', sectionId: 'sec-2', ringNo: 41, mileage: 5220, segmentType: '钢管片', installDate: '2019-10-30', createdAt: stamp(-94), updatedAt: stamp(-4), revision: ROW_REVISION }
+  // ring-1 第 118 环：2024-03 大修换环，原环留档（ring-1），新环沿用环号（ring-6）
+  {
+    id: 'ring-1',
+    sectionId: 'sec-1',
+    ringNo: 118,
+    mileage: 12300,
+    segmentType: '钢筋混凝土',
+    installDate: '2016-04-18',
+    status: 'archived',
+    generation: 1,
+    lineageId: 'ring-1',
+    replacedById: 'rep-1',
+    replacedDate: '2024-03-18',
+    createdAt: stamp(-118),
+    updatedAt: stamp(-94),
+    revision: ROW_REVISION
+  },
+  { id: 'ring-2', sectionId: 'sec-1', ringNo: 132, mileage: 12468, segmentType: '钢筋混凝土', installDate: '2016-05-02', status: 'current', generation: 1, lineageId: 'ring-2', createdAt: stamp(-117), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'ring-3', sectionId: 'sec-1', ringNo: 145, mileage: 12625, segmentType: '铸铁', installDate: '2016-06-11', status: 'current', generation: 1, lineageId: 'ring-3', createdAt: stamp(-116), updatedAt: stamp(-5), revision: ROW_REVISION },
+  { id: 'ring-4', sectionId: 'sec-2', ringNo: 27, mileage: 5080, segmentType: '钢筋混凝土', installDate: '2019-09-23', status: 'current', generation: 1, lineageId: 'ring-4', createdAt: stamp(-95), updatedAt: stamp(-4), revision: ROW_REVISION },
+  { id: 'ring-5', sectionId: 'sec-2', ringNo: 41, mileage: 5220, segmentType: '钢管片', installDate: '2019-10-30', status: 'current', generation: 1, lineageId: 'ring-5', createdAt: stamp(-94), updatedAt: stamp(-4), revision: ROW_REVISION },
+  // ring-6 第 118 环（第 2 代，当前环）：从零建档，暂无裂缝
+  {
+    id: 'ring-6',
+    sectionId: 'sec-1',
+    ringNo: 118,
+    mileage: 12301,
+    segmentType: '钢管片',
+    installDate: '2024-03-18',
+    status: 'current',
+    generation: 2,
+    lineageId: 'ring-1',
+    previousRingId: 'ring-1',
+    replacementId: 'rep-1',
+    createdAt: stamp(-94),
+    updatedAt: stamp(-94),
+    revision: ROW_REVISION
+  }
 ]
 
 const SEED_CRACKS: CrackRow[] = [
+  // ring-1 已留档：换环前裂缝仍挂在原环片，按原环号可查，不会错挂到 ring-6
   { id: 'crack-1', ringId: 'ring-1', sectionId: 'sec-1', code: 'SL-118-01', position: '拱顶', direction: '纵向', widthMm: 0.42, lengthMm: 620, state: '待整治', createdAt: stamp(-110), updatedAt: stamp(-3), revision: ROW_REVISION },
   { id: 'crack-2', ringId: 'ring-1', sectionId: 'sec-1', code: 'SL-118-02', position: '侧墙', direction: '环向', widthMm: 0.18, lengthMm: 410, state: '观察', createdAt: stamp(-110), updatedAt: stamp(-8), revision: ROW_REVISION },
   { id: 'crack-3', ringId: 'ring-2', sectionId: 'sec-1', code: 'SL-132-01', position: '道床', direction: '斜向', widthMm: 0.55, lengthMm: 880, state: '待整治', createdAt: stamp(-104), updatedAt: stamp(-3), revision: ROW_REVISION },
@@ -188,7 +267,7 @@ const SEED_CRACKS: CrackRow[] = [
 ]
 
 const SEED_SURVEYS: SurveyRow[] = [
-  // crack-1：0.42 → 0.71 → 1.02，末次月均 0.31 mm/月（严重）
+  // crack-1（已留档环上的历史裂缝）：全部复测保留
   { id: 'sv-1-1', crackId: 'crack-1', seq: 1, date: '2024-04-08', widthMm: 0.42, lengthMm: 620, deltaWidthMm: 0, surveyor: '周维', createdAt: stamp(-73), updatedAt: stamp(-73), revision: ROW_REVISION },
   { id: 'sv-1-2', crackId: 'crack-1', seq: 2, date: '2024-05-08', widthMm: 0.71, lengthMm: 690, deltaWidthMm: 0.29, surveyor: '周维', createdAt: stamp(-43), updatedAt: stamp(-43), revision: ROW_REVISION },
   { id: 'sv-1-3', crackId: 'crack-1', seq: 3, date: '2024-06-07', widthMm: 1.02, lengthMm: 745, deltaWidthMm: 0.31, surveyor: '李文博', createdAt: stamp(-13), updatedAt: stamp(-13), revision: ROW_REVISION },
@@ -217,15 +296,53 @@ const SEED_ADVICES: AdviceRow[] = [
   { id: 'ad-4', crackId: 'crack-2', level: '一般', measure: '注浆', basis: '宽度缓慢增长，侧墙环向裂缝建议预防性注浆封堵', state: '待下发', createdAt: stamp(-7), updatedAt: stamp(-7), revision: ROW_REVISION }
 ]
 
+// 已确认的换环单：ring-1（第118环 第1代）→ ring-6（第118环 第2代），换环前 2 条裂缝/7 次复测/2 条建议随原环留档
+const SEED_REPLACEMENTS: ReplacementRow[] = [
+  {
+    id: 'rep-1',
+    oldRingId: 'ring-1',
+    newRingId: 'ring-6',
+    status: 'done',
+    replaceDate: '2024-03-18',
+    reason: '拱顶纵向裂缝宽度超限且持续发展，整环错台超标，大修更换整环管片',
+    newSegmentType: '钢管片',
+    newInstallDate: '2024-03-18',
+    newMileage: 12301,
+    installer: '隧道维保一分队',
+    remark: '换环后新环从零建档观测',
+    scope: {
+      crackIds: ['crack-1', 'crack-2'],
+      surveyIds: ['sv-1-1', 'sv-1-2', 'sv-1-3', 'sv-2-1', 'sv-2-2', 'sv-2-3'],
+      adviceIds: ['ad-1', 'ad-4'],
+      // 已确认单据不再做漂移复核，指纹留空即可；数量快照用于台账展示
+      fingerprint: '',
+      crackCount: 2,
+      surveyCount: 6,
+      adviceCount: 2,
+      previewedAt: stamp(-95)
+    },
+    attempts: 1,
+    confirmedAt: stamp(-94),
+    createdAt: stamp(-95),
+    updatedAt: stamp(-94),
+    revision: ROW_REVISION
+  }
+]
+
 /** 幂等播种：仅当主表为空时写入演示数据 */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.rings.bulkPut(SEED_RINGS)
-    await db.cracks.bulkPut(SEED_CRACKS)
-    await db.surveys.bulkPut(SEED_SURVEYS)
-    await db.advices.bulkPut(SEED_ADVICES)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.replacements],
+    async () => {
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.rings.bulkPut(SEED_RINGS)
+      await db.cracks.bulkPut(SEED_CRACKS)
+      await db.surveys.bulkPut(SEED_SURVEYS)
+      await db.advices.bulkPut(SEED_ADVICES)
+      await db.replacements.bulkPut(SEED_REPLACEMENTS)
+    }
+  )
 }
 
 /** 应用启动时调用：打开数据库并在首屏为空时播种 */
@@ -238,21 +355,29 @@ export async function initDatabase(): Promise<void> {
 
 /* ============================== 级联删除 ============================== */
 
-/** 删除区间：级联删除环片 → 裂缝 → 复测 → 建议 */
+/** 删除区间：级联删除换环单 → 环片 → 裂缝 → 复测 → 建议 */
 export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    const rings = await db.rings.where('sectionId').equals(sectionId).toArray()
-    const ringIds = rings.map((ring) => ring.id)
-    await deleteCracksOfRings(ringIds)
-    if (ringIds.length > 0) await db.rings.bulkDelete(ringIds)
-    await db.sections.delete(sectionId)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.replacements],
+    async () => {
+      const rings = await db.rings.where('sectionId').equals(sectionId).toArray()
+      const ringIds = rings.map((ring) => ring.id)
+      await deleteCracksOfRings(ringIds)
+      if (ringIds.length > 0) {
+        await db.replacements.where('oldRingId').anyOf(ringIds).delete()
+        await db.rings.bulkDelete(ringIds)
+      }
+      await db.sections.delete(sectionId)
+    }
+  )
 }
 
-/** 删除环片：级联删除裂缝及其下游 */
+/** 删除环片：级联删除裂缝及其下游（换环留档环禁止删除，由业务层先行拦截） */
 export async function deleteRingCascade(ringId: string): Promise<void> {
-  await db.transaction('rw', db.rings, db.cracks, db.surveys, db.advices, async () => {
+  await db.transaction('rw', db.rings, db.cracks, db.surveys, db.advices, db.replacements, async () => {
     await deleteCracksOfRings([ringId])
+    await db.replacements.where('oldRingId').equals(ringId).delete()
     await db.rings.delete(ringId)
   })
 }
@@ -281,24 +406,26 @@ async function deleteCracksOfRings(ringIds: string[]): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, replacements] = await Promise.all([
     db.sections.count(),
     db.rings.count(),
     db.cracks.count(),
     db.surveys.count(),
-    db.advices.count()
+    db.advices.count(),
+    db.replacements.count()
   ])
-  return { sections, rings, cracks, surveys, advices }
+  return { sections, rings, cracks, surveys, advices, replacements }
 }
 
 /** 导出整库快照（剥离内部 revision 字段） */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, replacements] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.replacements.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -312,40 +439,66 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     rings: rings.map(strip),
     cracks: cracks.map(strip),
     surveys: surveys.map(strip),
-    advices: advices.map(strip)
+    advices: advices.map(strip),
+    replacements: replacements.map(strip)
   }
 }
 
-/** 用快照覆盖整库 */
+/**
+ * 用快照覆盖整库。
+ * 兼容 v1/v2 旧备份：无 replacements 按空处理；无换环字段的环片按当前环首环补齐，
+ * 裂缝与复测一律保持原 ringId/crackId 归属，升级过程绝不重挂到新环片。
+ */
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.rings.bulkPut((payload.rings ?? []).map(rev))
-    await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
-    await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
-    await db.advices.bulkPut((payload.advices ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.replacements],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.replacements.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      // 旧备份环片升级：补齐档案状态/世代/血缘链，保持原 id 不变
+      await db.rings.bulkPut(
+        (payload.rings ?? []).map((ring) =>
+          rev({
+            ...ring,
+            status: ring.status === 'archived' ? 'archived' : 'current',
+            generation: typeof ring.generation === 'number' && ring.generation > 0 ? ring.generation : 1,
+            lineageId: ring.lineageId || ring.id
+          })
+        )
+      )
+      await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
+      await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
+      await db.advices.bulkPut((payload.advices ?? []).map(rev))
+      await db.replacements.bulkPut((payload.replacements ?? []).map(rev))
+    }
+  )
 }
 
 /** 清空全部业务表 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.replacements],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.replacements.clear()
+      ])
+    }
+  )
 }
 
 /** 清空后重新播种（演示数据重置） */

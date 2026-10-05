@@ -7,14 +7,16 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Files, Grid, Plus, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, Files, Grid, Plus, Switch, TrendCharts } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import ReplacementWizard from '@/components/replacement/ReplacementWizard.vue'
 import { useSectionStore, type RingEnriched } from '@/stores/sectionStore'
 import { useCrackStore } from '@/stores/crackStore'
 import { useSurveyStore } from '@/stores/surveyStore'
-import { EMPTY_RING_DRAFT, type Ring, type RingDraft } from '@/types/ring'
+import { useReplacementStore } from '@/stores/replacementStore'
+import { EMPTY_RING_DRAFT, isArchivedRing, type Ring, type RingDraft } from '@/types/ring'
 import { EMPTY_SECTION_DRAFT, formatMileage, type Section, type SectionDraft, type StructureType } from '@/types/section'
 
 type FilterModel = { keyword: string; [key: string]: string | string[] | boolean }
@@ -23,6 +25,7 @@ const router = useRouter()
 const sectionStore = useSectionStore()
 const crackStore = useCrackStore()
 const surveyStore = useSurveyStore()
+const replacementStore = useReplacementStore()
 
 /* ------------------------------ 筛选 ------------------------------ */
 
@@ -159,24 +162,48 @@ async function submitRing(): Promise<void> {
   const valid = await form.validate().catch(() => false)
   if (!valid) return
   if (editingRingId) {
-    await sectionStore.updateRing(editingRingId, { ...ringForm })
+    await sectionStore.updateRing(editingRingId, { ...ringForm }).catch(() => undefined)
     ElMessage.success('环片已更新')
   } else {
-    await sectionStore.createRing({ ...ringForm })
+    await sectionStore.createRing({ ...ringForm }).catch(() => undefined)
     ElMessage.success('环片已录入')
   }
   ringDialogVisible.value = false
 }
 
 async function removeRing(ring: Ring): Promise<void> {
+  if (isArchivedRing(ring)) {
+    ElMessage.warning('已换环已整体留档，不能删除；可在「换环管理」查看留档历史')
+    return
+  }
   const confirmed = await ElMessageBox.confirm(
     `删除第 ${ring.ringNo} 环将同时删除该环的裂缝与复测记录，确认删除？`,
     '删除确认',
     { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await sectionStore.removeRing(ring.id)
+  await sectionStore.removeRing(ring.id).catch(() => undefined)
   ElMessage.success('环片及其下游数据已删除')
+}
+
+/* ------------------------------ 换环入口 ------------------------------ */
+
+const wizardVisible = ref(false)
+const wizardRing = ref<Ring | null>(null)
+
+function openReplace(ring: Ring): void {
+  if (isArchivedRing(ring)) {
+    ElMessage.info('该环已换环留档，不允许再次换环；当前环为同环号的下一代环片')
+    return
+  }
+  const active = replacementStore.activeOrderMap.get(ring.id)
+  if (active) {
+    ElMessage.warning('该环已有待确认换环单，请到「换环管理」继续预览确认')
+    void router.push('/replacements')
+    return
+  }
+  wizardRing.value = ring
+  wizardVisible.value = true
 }
 
 /* ---------------------------- 派生展示 ---------------------------- */
@@ -219,8 +246,13 @@ function ringRowKey(row: RingEnriched): string {
   return row.ring.id
 }
 
-const totalCracks = computed(() => crackStore.cracks.length)
-const totalRings = computed(() => sectionStore.rings.length)
+function ringRowClassName({ row }: { row: RingEnriched }): string {
+  return row.archived ? 'ring-archived-row' : ''
+}
+
+const totalCracks = computed(() => crackStore.currentCracks.length)
+const totalRings = computed(() => sectionStore.currentRings.length)
+const archivedRingCount = computed(() => sectionStore.archivedRings.length)
 </script>
 
 <template>
@@ -235,15 +267,16 @@ const totalRings = computed(() => sectionStore.rings.length)
       <div class="page-head__actions">
         <el-button type="primary" :icon="Plus" @click="openCreateSection">新建区间</el-button>
         <el-button :icon="Grid" :disabled="!sectionStore.currentSectionId" @click="openCreateRing">录入环片</el-button>
+        <el-button :icon="Switch" @click="router.push('/replacements')">换环管理</el-button>
       </div>
     </div>
 
     <div class="stat-row">
       <StatBadge label="区间总数" :value="sectionStore.sections.length" suffix="个" icon="Files" tone="primary" />
-      <StatBadge label="环片总数" :value="totalRings" suffix="环" icon="Grid" tone="info" />
-      <StatBadge label="裂缝总数" :value="totalCracks" suffix="条" icon="Histogram" tone="default" />
+      <StatBadge label="当前环" :value="totalRings" suffix="环" icon="Grid" tone="info" />
+      <StatBadge label="已换环留档" :value="archivedRingCount" suffix="环" icon="Switch" tone="default" />
       <StatBadge
-        label="预警占比"
+        label="当前环预警"
         :value="crackStore.warningCount"
         :percent="totalCracks === 0 ? 0 : crackStore.warningPercent"
         icon="WarningFilled"
@@ -283,7 +316,7 @@ const totalRings = computed(() => sectionStore.rings.length)
           <div class="section-card__meta">
             <span>{{ formatMileage(section.startMileage) }} ～ {{ formatMileage(section.endMileage) }}</span>
             <span>· {{ section.ringCount }} 环</span>
-            <span>· 裂缝 {{ statOf(section.id).crackCount }}</span>
+            <span>· 当前环裂缝 {{ statOf(section.id).crackCount }}</span>
             <span :style="{ color: statOf(section.id).warningCount > 0 ? '#c0392b' : undefined }">
               · 预警 {{ statOf(section.id).warningCount }}
             </span>
@@ -327,6 +360,14 @@ const totalRings = computed(() => sectionStore.rings.length)
               @change="onMileageChange"
             />
             <el-button size="small" :icon="TrendCharts" @click="sectionStore.setMileageRange(null, null)">清除里程</el-button>
+            <el-tooltip content="打开后同时显示已换环（历史留档），其裂缝与复测只读可查" placement="top">
+              <el-switch
+                :model-value="sectionStore.showArchivedRings"
+                active-text="含已换环历史"
+                inline-prompt
+                @update:model-value="(v: boolean) => (sectionStore.showArchivedRings = v)"
+              />
+            </el-tooltip>
           </div>
         </div>
 
@@ -341,12 +382,16 @@ const totalRings = computed(() => sectionStore.rings.length)
           @secondary="sectionStore.resetFilter()"
         />
 
-        <el-table v-else :data="sectionStore.filteredRings" :row-key="ringRowKey" border stripe>
+        <el-table v-else :data="sectionStore.filteredRings" :row-key="ringRowKey" border stripe
+          :row-class-name="ringRowClassName">
           <el-table-column type="expand">
             <template #default="{ row }">
               <div style="padding: 8px 16px">
                 <div class="muted" style="margin-bottom: 6px">
-                  第 {{ row.ring.ringNo }} 环共 {{ cracksOfRing(row.ring.id).length }} 条裂缝
+                  {{ row.generationLabel }}（{{ row.archived ? '已换环留档' : '当前环' }}）共 {{ cracksOfRing(row.ring.id).length }} 条裂缝
+                  <el-tag v-if="row.archived" size="small" type="info" effect="plain" style="margin-left: 8px">
+                    换环前历史记录，只读
+                  </el-tag>
                 </div>
                 <el-table :data="cracksOfRing(row.ring.id)" size="small" border>
                   <el-table-column prop="code" label="裂缝编号" width="140" />
@@ -369,14 +414,18 @@ const totalRings = computed(() => sectionStore.rings.length)
                     </template>
                   </el-table-column>
                   <template #empty>
-                    <span class="muted">该环暂未登记裂缝</span>
+                    <span class="muted">{{ row.archived ? '该已换环无留档裂缝；新环从零建档' : '该环暂未登记裂缝' }}</span>
                   </template>
                 </el-table>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="环号" width="100">
-            <template #default="{ row }">第 {{ row.ring.ringNo }} 环</template>
+          <el-table-column label="环号 / 世代" min-width="150">
+            <template #default="{ row }">
+              <div>{{ row.generationLabel }}</div>
+              <el-tag v-if="row.archived" size="small" type="info" effect="plain">已换环历史</el-tag>
+              <el-tag v-else size="small" type="success" effect="plain">当前环</el-tag>
+            </template>
           </el-table-column>
           <el-table-column label="里程" width="120">
             <template #default="{ row }">{{ row.mileageText }}</template>
@@ -384,15 +433,27 @@ const totalRings = computed(() => sectionStore.rings.length)
           <el-table-column label="管片类型" width="130">
             <template #default="{ row }">{{ row.ring.segmentType }}</template>
           </el-table-column>
-          <el-table-column prop="ring.installDate" label="安装日期" width="130" />
+          <el-table-column label="安装 / 换环日期" width="150">
+            <template #default="{ row }">
+              <div>{{ row.ring.installDate }}</div>
+              <div v-if="row.archived" class="muted" style="font-size: 12px">换环 {{ row.ring.replacedDate ?? '—' }}</div>
+            </template>
+          </el-table-column>
           <el-table-column label="裂缝数" width="90">
             <template #default="{ row }">{{ cracksOfRing(row.ring.id).length }}</template>
           </el-table-column>
-          <el-table-column label="操作" min-width="200" fixed="right">
+          <el-table-column label="操作" min-width="250" fixed="right">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="openEditRing(row.ring)">编辑</el-button>
-              <el-button size="small" text type="danger" @click="removeRing(row.ring)">删除</el-button>
-              <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">裂缝台账</el-button>
+              <template v-if="!row.archived">
+                <el-button size="small" text type="primary" @click="openEditRing(row.ring)">编辑</el-button>
+                <el-button size="small" text type="danger" @click="removeRing(row.ring)">删除</el-button>
+                <el-button size="small" text type="warning" :icon="Switch" @click="openReplace(row.ring)">换环</el-button>
+                <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">裂缝台账</el-button>
+              </template>
+              <template v-else>
+                <el-button size="small" text type="primary" disabled>留档只读</el-button>
+                <el-button size="small" text type="primary" @click="goCrackEntry(row.ring.sectionId)">历史裂缝</el-button>
+              </template>
             </template>
           </el-table-column>
         </el-table>
@@ -450,6 +511,8 @@ const totalRings = computed(() => sectionStore.rings.length)
         <el-button type="primary" @click="submitRing">保存</el-button>
       </template>
     </el-dialog>
+
+    <ReplacementWizard v-model="wizardVisible" :ring="wizardRing" @confirmed="() => (wizardVisible = false)" />
   </div>
 </template>
 
@@ -472,5 +535,10 @@ const totalRings = computed(() => sectionStore.rings.length)
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+:deep(.ring-archived-row) {
+  background: #f4f6fa !important;
+  color: #8c99ab;
 }
 </style>

@@ -13,6 +13,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '区间与环片里程台账', icon: 'Files' }
   },
   {
+    path: '/replacements',
+    name: 'replacement-manage',
+    component: () => import('@/pages/ReplacementManage.vue'),
+    meta: { title: '换环管理（原环留档 / 新环建档）', icon: 'Switch' }
+  },
+  {
     path: '/cracks',
     name: 'crack-entry',
     component: () => import('@/pages/CrackEntry.vue'),

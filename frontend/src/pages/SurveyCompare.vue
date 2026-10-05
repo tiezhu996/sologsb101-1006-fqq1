@@ -21,6 +21,7 @@ import {
 } from '@/types/survey'
 import type { CrackDirection, CrackPosition } from '@/types/crack'
 import { round } from '@/utils/rate'
+import { ReplacementError, replacementErrorText } from '@/types/replacement'
 
 type FilterModel = { keyword: string; [key: string]: string | string[] | boolean }
 
@@ -59,6 +60,15 @@ function onFilterChange(model: FilterModel): void {
 }
 
 const candidateCracks = computed(() => crackStore.filtered)
+
+/** 顶部统计默认只算当前环；已换环历史需显式打开开关后才在列表只读查看 */
+const currentSurveys = computed(() =>
+  surveyStore.surveys.filter((survey) => !crackStore.archivedCrackIds.has(survey.crackId))
+)
+const currentRates = computed(() =>
+  surveyStore.rates.filter((item) => !crackStore.archivedCrackIds.has(item.crackId))
+)
+const currentMaxRate = computed(() => (currentRates.value.length > 0 ? currentRates.value[0].rate : 0))
 
 /* ------------------------------ 折线图 ------------------------------ */
 
@@ -147,14 +157,18 @@ async function submit(): Promise<void> {
   if (!instance) return
   const valid = await instance.validate().catch(() => false)
   if (!valid) return
-  if (editingId) {
-    await surveyStore.updateSurvey(editingId, { ...form })
-    ElMessage.success('测次已更新，变化量与速率已重新计算')
-  } else {
-    await surveyStore.createSurvey({ ...form })
-    ElMessage.success('测次已追加，变化量已自动比对')
+  try {
+    if (editingId) {
+      await surveyStore.updateSurvey(editingId, { ...form })
+      ElMessage.success('测次已更新，变化量与速率已重新计算')
+    } else {
+      await surveyStore.createSurvey({ ...form })
+      ElMessage.success('测次已追加，变化量已自动比对')
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof ReplacementError ? replacementErrorText(error.code) : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function removeSurvey(surveyId: string, seq: number): Promise<void> {
@@ -164,8 +178,12 @@ async function removeSurvey(surveyId: string, seq: number): Promise<void> {
     cancelButtonText: '取消'
   }).catch(() => false)
   if (!confirmed) return
-  await surveyStore.removeSurvey(surveyId)
-  ElMessage.success('测次已删除')
+  try {
+    await surveyStore.removeSurvey(surveyId)
+    ElMessage.success('测次已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof ReplacementError ? replacementErrorText(error.code) : '删除失败')
+  }
 }
 
 function selectCrack(crackId: string): void {
@@ -183,17 +201,28 @@ function selectCrack(crackId: string): void {
         </p>
       </div>
       <div class="page-head__actions">
-        <el-button type="primary" :icon="Plus" :disabled="!activeCrackId" @click="openCreate">追加测次</el-button>
+        <el-tooltip content="打开后可只读查看已换环裂缝的历史复测，不能追加或修改" placement="top">
+          <el-switch
+            :model-value="crackStore.includeArchived"
+            active-text="含已换环历史"
+            inline-prompt
+            style="margin-right: 10px"
+            @update:model-value="crackStore.setIncludeArchived"
+          />
+        </el-tooltip>
+        <el-button type="primary" :icon="Plus" :disabled="!activeCrackId || activeCrack?.archived" @click="openCreate">
+          追加测次
+        </el-button>
       </div>
     </div>
 
     <div class="stat-row">
-      <StatBadge label="测次总数" :value="surveyStore.surveys.length" suffix="次" icon="DataLine" tone="primary" />
-      <StatBadge label="已复测裂缝" :value="surveyStore.rates.length" suffix="条" icon="Files" tone="info" />
-      <StatBadge label="预警裂缝" :value="surveyStore.warningCrackIds.length" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="当前环测次" :value="currentSurveys.length" suffix="次" icon="DataLine" tone="primary" />
+      <StatBadge label="已复测裂缝" :value="currentRates.length" suffix="条" icon="Files" tone="info" />
+      <StatBadge label="当前环预警" :value="crackStore.warningCount" suffix="条" icon="WarningFilled" tone="danger" />
       <StatBadge
         label="最高月均速率"
-        :value="surveyStore.rates.length > 0 ? surveyStore.rates[0].rate.toFixed(3) : '0.000'"
+        :value="currentMaxRate.toFixed(3)"
         suffix="mm/月"
         icon="TrendCharts"
         tone="warning"
@@ -230,6 +259,7 @@ function selectCrack(crackId: string): void {
           <div class="section-card__meta">
             <span>{{ item.sectionLabel }}</span>
             <span>· {{ item.ringLabel }}</span>
+            <el-tag v-if="item.archived" size="small" type="info" effect="plain">已换环历史</el-tag>
           </div>
           <div class="section-card__meta">
             <span>{{ item.crack.position }} / {{ item.crack.direction }}</span>
@@ -247,6 +277,7 @@ function selectCrack(crackId: string): void {
               <span class="muted">{{ activeCrack.sectionLabel }} / {{ activeCrack.ringLabel }}</span>
             </h3>
             <div style="display: flex; align-items: center; gap: 8px">
+              <el-tag v-if="activeCrack.archived" type="info" effect="plain">已换环历史 · 复测只读</el-tag>
               <span class="muted">
                 累计变化 {{ trend.delta.value.toFixed(2) }} mm · 月均 {{ trend.rate.value.toFixed(3) }} mm/月
               </span>
@@ -314,10 +345,10 @@ function selectCrack(crackId: string): void {
             <el-table-column prop="surveyor" label="复测人" width="100" />
             <el-table-column label="操作" width="140">
               <template #default="{ row }">
-                <el-button size="small" text type="primary" @click="openEdit(row.id)">
+                <el-button size="small" text type="primary" :disabled="activeCrack.archived" @click="openEdit(row.id)">
                   <el-icon><Edit /></el-icon>
                 </el-button>
-                <el-button size="small" text type="danger" @click="removeSurvey(row.id, row.seq)">
+                <el-button size="small" text type="danger" :disabled="activeCrack.archived" @click="removeSurvey(row.id, row.seq)">
                   <el-icon><Delete /></el-icon>
                 </el-button>
               </template>

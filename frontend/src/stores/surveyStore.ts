@@ -9,6 +9,8 @@ import { db, type SurveyRow } from '@/utils/db'
 import type { Survey, SurveyDraft } from '@/types/survey'
 import type { AdviceLevel } from '@/types/advice'
 import { buildSurveyPoints, levelFromRate, round } from '@/utils/rate'
+import { isArchivedRing } from '@/types/ring'
+import { ReplacementError } from '@/types/replacement'
 
 export interface CrackRateSummary {
   crackId: string
@@ -97,10 +99,21 @@ export const useSurveyStore = defineStore('survey', () => {
     activeCrackId.value = id
   }
 
+  /** 写入守卫：裂缝所属环若已换环留档，复测记录只读（换环前测次必须原样保留） */
+  async function assertCrackWritable(crackId: string): Promise<void> {
+    const crack = await db.cracks.get(crackId)
+    if (!crack) throw new ReplacementError('NOT_FOUND', '裂缝不存在')
+    const ring = await db.rings.get(crack.ringId)
+    if (isArchivedRing(ring)) {
+      throw new ReplacementError('ARCHIVED_RING_READONLY', '该裂缝属于已换环历史档案，复测记录只读，不能新增或修改')
+    }
+  }
+
   /**
    * 追加一次复测读数：自动取下一个测次序号并与前一次比对生成变化量
    */
   async function createSurvey(draft: SurveyDraft): Promise<SurveyRow> {
+    await assertCrackWritable(draft.crackId)
     const existing = surveysOf(draft.crackId)
     const previous = existing.length > 0 ? existing[existing.length - 1] : null
     const seq = previous ? previous.seq + 1 : 1
@@ -125,6 +138,7 @@ export const useSurveyStore = defineStore('survey', () => {
   async function updateSurvey(id: string, draft: SurveyDraft): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
+    await assertCrackWritable(draft.crackId)
     await surveyTable.update(id, {
       date: draft.date,
       widthMm: round(draft.widthMm, 2),
@@ -137,6 +151,7 @@ export const useSurveyStore = defineStore('survey', () => {
   async function removeSurvey(id: string): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
+    await assertCrackWritable(row.crackId)
     await surveyTable.remove(id)
     await recalculate(row.crackId)
   }

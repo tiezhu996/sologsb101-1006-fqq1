@@ -72,11 +72,12 @@ const ranked = computed<CrackEnriched[]>(() => {
   return [...source].sort((a, b) => b.rate - a.rate)
 })
 
-const severeRows = computed(() => crackStore.enriched.filter((item) => item.level === '严重'))
-const warningRows = computed(() => crackStore.enriched.filter((item) => item.level !== '一般'))
+// 预警 / 严重 / 平均速率一律只按当前环口径，已换环历史不混入
+const severeRows = computed(() => crackStore.currentEnriched.filter((item) => item.level === '严重'))
+const warningRows = computed(() => crackStore.currentEnriched.filter((item) => item.level !== '一般'))
 
 const averageRate = computed(() => {
-  const rated = crackStore.enriched.filter((item) => item.surveyCount > 1)
+  const rated = crackStore.currentEnriched.filter((item) => item.surveyCount > 1)
   if (rated.length === 0) return 0
   return round(rated.reduce((sum, item) => sum + item.rate, 0) / rated.length, 3)
 })
@@ -88,6 +89,10 @@ function adviceOf(crackId: string): Advice | null {
 }
 
 async function generateAdvice(row: CrackEnriched): Promise<void> {
+  if (row.archived) {
+    ElMessage.warning('该裂缝属于已换环历史档案，整治建议随原环留档，不能新增')
+    return
+  }
   if (adviceOf(row.crack.id)) {
     ElMessage.info(`${row.crack.code} 已存在整治建议，可在「建议与备份」页维护`)
     return
@@ -202,6 +207,15 @@ function onOnlyWarningChange(value: string | number | boolean): void {
         </p>
       </div>
       <div class="page-head__actions">
+        <el-tooltip content="打开后附带只读查看已换环裂缝的历史速率，不参与当前预警" placement="top">
+          <el-switch
+            :model-value="crackStore.includeArchived"
+            active-text="含已换环历史"
+            inline-prompt
+            style="margin-right: 10px"
+            @update:model-value="crackStore.setIncludeArchived"
+          />
+        </el-tooltip>
         <el-switch
           :model-value="crackStore.onlyWarning"
           active-text="仅看预警"
@@ -212,7 +226,7 @@ function onOnlyWarningChange(value: string | number | boolean): void {
     </div>
 
     <div class="stat-row">
-      <StatBadge label="裂缝总数" :value="crackStore.cracks.length" suffix="条" icon="Files" tone="primary" />
+      <StatBadge label="当前环裂缝" :value="crackStore.currentCracks.length" suffix="条" icon="Files" tone="primary" />
       <StatBadge label="预警裂缝" :value="warningRows.length" suffix="条" icon="WarningFilled" tone="warning" />
       <StatBadge label="严重裂缝" :value="severeRows.length" suffix="条" icon="CircleCloseFilled" tone="danger" />
       <StatBadge label="平均月均速率" :value="averageRate.toFixed(3)" suffix="mm/月" icon="TrendCharts" tone="info" />
@@ -227,8 +241,8 @@ function onOnlyWarningChange(value: string | number | boolean): void {
 
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
-        <h3 class="panel-title">速率排行（{{ ranked.length }} / {{ crackStore.cracks.length }}）</h3>
-        <span class="muted">点击「曲线」查看该裂缝全部测次与建议状态</span>
+        <h3 class="panel-title">速率排行（{{ ranked.length }} / 当前环 {{ crackStore.currentCracks.length }}）</h3>
+        <span class="muted">预警仅统计当前环；点击「曲线」查看全部测次，已换环历史只读</span>
       </div>
 
       <EmptyPanel
@@ -250,8 +264,11 @@ function onOnlyWarningChange(value: string | number | boolean): void {
         <el-table-column label="区间 / 里程" min-width="170">
           <template #default="{ row }">{{ row.sectionLabel }}</template>
         </el-table-column>
-        <el-table-column label="环号" width="96">
-          <template #default="{ row }">{{ row.ringLabel }}</template>
+        <el-table-column label="环号" min-width="150">
+          <template #default="{ row }">
+            {{ row.ringLabel }}
+            <el-tag v-if="row.archived" size="small" type="info" effect="plain">已换环历史</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="部位/走向" width="110">
           <template #default="{ row }">{{ row.crack.position }} / {{ row.crack.direction }}</template>
@@ -296,7 +313,14 @@ function onOnlyWarningChange(value: string | number | boolean): void {
             <el-button size="small" text type="primary" @click="openDrawer(row)">
               <el-icon><View /></el-icon> 曲线
             </el-button>
-            <el-button size="small" text type="primary" :icon="MagicStick" @click="generateAdvice(row)">
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :icon="MagicStick"
+              :disabled="row.archived"
+              @click="generateAdvice(row)"
+            >
               生成建议
             </el-button>
             <el-button
@@ -304,7 +328,7 @@ function onOnlyWarningChange(value: string | number | boolean): void {
               text
               type="primary"
               :icon="Edit"
-              :disabled="!adviceOf(row.crack.id)"
+              :disabled="!adviceOf(row.crack.id) || row.archived"
               @click="openAdviceEdit(row)"
             >
               维护
@@ -314,7 +338,7 @@ function onOnlyWarningChange(value: string | number | boolean): void {
               text
               type="danger"
               :icon="Delete"
-              :disabled="!adviceOf(row.crack.id)"
+              :disabled="!adviceOf(row.crack.id) || row.archived"
               @click="removeAdvice(row)"
             >
               撤销

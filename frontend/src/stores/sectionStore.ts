@@ -22,14 +22,21 @@ import {
   type SectionDraft,
   type StructureType
 } from '@/types/section'
-import { SEGMENT_TYPES, type Ring, type RingDraft } from '@/types/ring'
+import { isArchivedRing, ringGenerationLabel, SEGMENT_TYPES, type Ring, type RingDraft } from '@/types/ring'
+import { findActiveReplacementOfRing } from '@/utils/replacement'
+import { ReplacementError } from '@/types/replacement'
+import { ElMessage } from 'element-plus'
 
 export interface RingEnriched {
   ring: Ring
   section: Section | null
   /** 环号展示文案 */
   label: string
+  /** 含世代/档案状态的环号文案，如「第 118 环（第 2 代）」 */
+  generationLabel: string
   mileageText: string
+  /** 是否已换环留档 */
+  archived: boolean
 }
 
 export const useSectionStore = defineStore('section', () => {
@@ -118,16 +125,32 @@ export const useSectionStore = defineStore('section', () => {
     [...ringTable.rows.value].sort((a, b) => a.mileage - b.mileage || a.ringNo - b.ringNo)
   )
 
-  const ringsOfSection = computed<RingRow[]>(() =>
-    currentSectionId.value === null ? rings.value : rings.value.filter((ring) => ring.sectionId === currentSectionId.value)
-  )
+  /** 当前环（在用，含从未换过的首环）：台账、裂缝、复测、预警默认只认当前环 */
+  const currentRings = computed<RingRow[]>(() => rings.value.filter((ring) => !isArchivedRing(ring)))
+
+  /** 已换环（历史留档）：换环前裂缝与全部复测仍挂这些环片，仅历史视图可查 */
+  const archivedRings = computed<RingRow[]>(() => rings.value.filter((ring) => isArchivedRing(ring)))
+
+  /** 台账页是否展示已换环历史（默认只看当前环） */
+  const showArchivedRings = ref(false)
+
+  const ringsOfSection = computed<RingRow[]>(() => {
+    const inSection =
+      currentSectionId.value === null
+        ? rings.value
+        : rings.value.filter((ring) => ring.sectionId === currentSectionId.value)
+    // 已换环默认隐藏，打开「含已换环历史」后才与当前环一起列出
+    return showArchivedRings.value ? inSection : inSection.filter((ring) => !isArchivedRing(ring))
+  })
 
   const enrichedRings = computed<RingEnriched[]>(() =>
     ringsOfSection.value.map((ring) => ({
       ring,
       section: sections.value.find((section) => section.id === ring.sectionId) ?? null,
       label: `第 ${ring.ringNo} 环`,
-      mileageText: formatMileage(ring.mileage)
+      generationLabel: ringGenerationLabel(ring),
+      mileageText: formatMileage(ring.mileage),
+      archived: isArchivedRing(ring)
     }))
   )
 
@@ -163,20 +186,45 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function createRing(draft: RingDraft): Promise<RingRow> {
+    const sectionId = draft.sectionId || currentSectionId.value || ''
+    const ringNo = Math.max(0, Math.round(draft.ringNo))
+    // 同一区间当前环环号唯一（换环后新环沿用环号由换环流程建档，不走这里）
+    const conflict = currentRings.value.find((ring) => ring.sectionId === sectionId && ring.ringNo === ringNo)
+    if (conflict) {
+      ElMessage.warning(`该区间已存在第 ${ringNo} 环（当前环）；如为大修换环请使用「换环登记」`)
+      throw new ReplacementError('RING_NO_CONFLICT', '同区间已存在同环号的当前环')
+    }
     const row = (await ringTable.create(
       {
-        sectionId: draft.sectionId || currentSectionId.value || '',
-        ringNo: Math.max(0, Math.round(draft.ringNo)),
+        sectionId,
+        ringNo,
         mileage: Math.max(0, Math.round(draft.mileage)),
         segmentType: draft.segmentType,
-        installDate: draft.installDate
+        installDate: draft.installDate,
+        status: 'current',
+        generation: 1,
+        lineageId: undefined
       },
       'ring'
     )) as RingRow
+    // 首环血缘链指向自身（create 后才有 id）
+    await db.rings.update(row.id, { lineageId: row.id })
     return row
   }
 
   async function updateRing(id: string, patch: Partial<RingDraft>): Promise<void> {
+    const ring = ringById.value.get(id)
+    if (ring && isArchivedRing(ring)) {
+      ElMessage.warning('已换环整体留档，原环里程与管片信息不可修改')
+      throw new ReplacementError('ARCHIVED_RING_READONLY', '已换环留档只读')
+    }
+    if (ring && (patch.ringNo !== undefined || patch.sectionId !== undefined)) {
+      const active = await findActiveReplacementOfRing(id)
+      if (active) {
+        ElMessage.warning('该环有待确认换环单，确认或作废前不能改环号/区间')
+        throw new ReplacementError('RING_BUSY', '存在待确认换环单')
+      }
+    }
     const next: Partial<RingRow> = { ...patch }
     if (patch.ringNo !== undefined) next.ringNo = Math.max(0, Math.round(patch.ringNo))
     if (patch.mileage !== undefined) next.mileage = Math.max(0, Math.round(patch.mileage))
@@ -184,6 +232,17 @@ export const useSectionStore = defineStore('section', () => {
   }
 
   async function removeRing(id: string): Promise<void> {
+    const ring = ringById.value.get(id)
+    if (ring && isArchivedRing(ring)) {
+      // 已换环历史必须保留，防止原环裂缝/复测失联
+      ElMessage.warning('已换环已整体留档，不能删除；换环前裂缝与复测仍需按原环片可查')
+      throw new ReplacementError('ARCHIVED_RING_READONLY', '已换环留档不可删除')
+    }
+    const active = await findActiveReplacementOfRing(id)
+    if (active) {
+      ElMessage.warning('该环存在待确认换环单，请先在换环管理中确认或作废')
+      throw new ReplacementError('RING_BUSY', '存在待确认换环单')
+    }
     await deleteRingCascade(id)
   }
 
@@ -200,6 +259,9 @@ export const useSectionStore = defineStore('section', () => {
     sections,
     filteredSections,
     rings,
+    currentRings,
+    archivedRings,
+    showArchivedRings,
     ringsOfSection,
     enrichedRings,
     filteredRings,
